@@ -1,14 +1,14 @@
 {
-  "companyName": "Tight A",
-  "ticker": "TIGHTA",
-  "tagline": "squeezing value till it pops",
+  "companyName": "Grokbot Board",
+  "ticker": "GRKB",
+  "tagline": "Neon circuits. Boardroom decisions.",
   "colors": {
     "bg": "#0d1117",
     "fg": "#e6edf3",
-    "accent": "#58a6ff",
-    "dim": "#8b949e"
+    "accent": "#39ff14",
+    "dim": "#0ba70b"
   },
   "fontStyle": "mono",
-  "updatedAt": 1787790303503,
-  "decidedBy": "S28"
+  "updatedAt": 1787791335660,
+  "decidedBy": "S30"
 }
