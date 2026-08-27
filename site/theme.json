@@ -1,14 +1,14 @@
 {
   "companyName": "Grokbot Board",
   "ticker": "GROKBOT",
-  "tagline": "Neon decisions, pixel-perfect governance.",
+  "tagline": "Neon core. Full grid. Locked in.",
   "colors": {
     "bg": "#0d1117",
     "fg": "#e6edf3",
     "accent": "#39ff14",
-    "dim": "#0a3d1f"
+    "dim": "#0a2e1f"
   },
   "fontStyle": "mono",
-  "updatedAt": 1787794586248,
-  "decidedBy": "S34"
+  "updatedAt": 1787797846451,
+  "decidedBy": "S39"
 }
