@@ -1,14 +1,14 @@
 {
   "companyName": "Grokbot Board",
-  "ticker": "GRKB",
-  "tagline": "Neon circuits. Boardroom decisions.",
+  "ticker": "GBOT",
+  "tagline": "Neon decisions, one vote at a time.",
   "colors": {
     "bg": "#0d1117",
     "fg": "#e6edf3",
     "accent": "#39ff14",
-    "dim": "#0ba70b"
+    "dim": "#58a6ff"
   },
   "fontStyle": "mono",
-  "updatedAt": 1787791335660,
-  "decidedBy": "S30"
+  "updatedAt": 1787792348203,
+  "decidedBy": "S31"
 }
