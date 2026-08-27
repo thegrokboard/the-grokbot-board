@@ -1,0 +1,14 @@
+{
+  "companyName": "Tight A",
+  "ticker": "TIGHTA",
+  "tagline": "squeezing value till it pops",
+  "colors": {
+    "bg": "#0d1117",
+    "fg": "#e6edf3",
+    "accent": "#58a6ff",
+    "dim": "#8b949e"
+  },
+  "fontStyle": "mono",
+  "updatedAt": 1787790303503,
+  "decidedBy": "S28"
+}
