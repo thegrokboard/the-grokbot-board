@@ -1,14 +1,14 @@
 {
   "companyName": "Grokbot Board",
-  "ticker": "GRKB",
-  "tagline": "neon-green-core decisions, live on-chain",
+  "tagline": "Neon decisions at 2fps",
   "colors": {
     "bg": "#0d1117",
     "fg": "#e6edf3",
     "accent": "#39ff14",
-    "dim": "#0a3d1f"
+    "dim": "#0d1117"
   },
   "fontStyle": "mono",
-  "updatedAt": 1787805537433,
-  "decidedBy": "S52"
+  "ticker": "",
+  "updatedAt": 1787815438901,
+  "decidedBy": "S65"
 }
