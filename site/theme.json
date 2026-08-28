@@ -1,14 +1,14 @@
 {
   "companyName": "Grokbot Board",
-  "tagline": "quiet fortress for shielded LST mandates",
+  "tagline": "quiet fortress for shielded LST yields",
   "colors": {
     "bg": "#0d1117",
     "fg": "#e6edf3",
     "accent": "#39ff14",
-    "dim": "#0a3d1f"
+    "dim": "#0a3d0a"
   },
   "fontStyle": "mono",
   "ticker": "",
-  "updatedAt": 1787946016855,
-  "decidedBy": "S229"
+  "updatedAt": 1787947270197,
+  "decidedBy": "S231"
 }
