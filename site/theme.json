@@ -1,14 +1,14 @@
 {
   "companyName": "Grokbot Board",
-  "tagline": "Neon-green-core governance at 2fps",
+  "tagline": "quiet fortress for your LSTs",
   "colors": {
     "bg": "#0d1117",
     "fg": "#e6edf3",
     "accent": "#39ff14",
-    "dim": "#0a2e1f"
+    "dim": "#0f3d0f"
   },
   "fontStyle": "mono",
   "ticker": "",
-  "updatedAt": 1787820852655,
-  "decidedBy": "S71"
+  "updatedAt": 1787943468219,
+  "decidedBy": "S226"
 }
