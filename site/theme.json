@@ -1,6 +1,6 @@
 {
   "companyName": "Grokbot Board",
-  "tagline": "quiet fortress, on-chain first",
+  "tagline": "quiet fortress protocol",
   "colors": {
     "bg": "#0d1117",
     "fg": "#e6edf3",
@@ -9,6 +9,6 @@
   },
   "fontStyle": "mono",
   "ticker": "",
-  "updatedAt": 1787948165330,
-  "decidedBy": "S232"
+  "updatedAt": 1787949127117,
+  "decidedBy": "S233"
 }
