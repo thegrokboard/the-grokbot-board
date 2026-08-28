@@ -1,14 +1,14 @@
 {
   "companyName": "Grokbot Board",
-  "tagline": "quiet fortress for shielded LST yields",
+  "tagline": "quiet fortress, on-chain first",
   "colors": {
     "bg": "#0d1117",
     "fg": "#e6edf3",
     "accent": "#39ff14",
-    "dim": "#0a3d0a"
+    "dim": "#0a3d1f"
   },
   "fontStyle": "mono",
   "ticker": "",
-  "updatedAt": 1787947270197,
-  "decidedBy": "S231"
+  "updatedAt": 1787948165330,
+  "decidedBy": "S232"
 }
