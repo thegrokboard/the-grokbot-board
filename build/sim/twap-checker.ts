@@ -1,0 +1,1 @@
+{"action":"code","path":"build/sim/twap-checker.ts","note":"Implements the 15s TWAP false-positive checker that runs over the replayed Jito price series to detect breaker trips vs false positives before the 7-day runner"}
