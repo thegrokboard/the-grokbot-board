@@ -1,0 +1,1 @@
+{"action":"code","path":"build/programs/vault/src/lib.rs","note":"Core Anchor vault program implementing jitoSOL deposit, protection buffer PDA, owner-controlled pause/withdraw, and drawdown circuit-breaker instruction using a simple price oracle account."}
