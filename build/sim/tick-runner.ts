@@ -1,0 +1,1 @@
+{"action":"code","path":"build/sim/tick-runner.ts","note":"Implements the 7-day tick runner that drives the full simulation using the lag injector and TWAP checker, replays historical Jito depeg series over simulated slots, logs breaker trips vs false positives, and provides exact run instructions."}
