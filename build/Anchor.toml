@@ -1,0 +1,1 @@
+{"action":"code","path":"build/Anchor.toml","note":"Initial project scaffold with Anchor.toml configuring the vault program, test validator, and sim scripts for the onchain JitoSOL depeg protection harness."}
