@@ -1,0 +1,34 @@
+name: build-ci
+on:
+  push:
+    paths: ["build/**", ".github/workflows/build-ci.yml"]
+  workflow_dispatch:
+jobs:
+  rust-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check program scaffolding
+        run: |
+          test -f build/Cargo.toml || test -f build/programs/vault/Cargo.toml || { echo "error: missing Cargo.toml (workspace build/Cargo.toml or build/programs/vault/Cargo.toml). The Rust program cannot compile without it."; exit 1; }
+      - uses: dtolnay/rust-toolchain@1.79.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        working-directory: build
+        run: |
+          if [ -f Cargo.toml ]; then cargo check 2>&1; else cd programs/vault && cargo check 2>&1; fi
+  ts-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Check sim scaffolding
+        run: |
+          test -f build/package.json || { echo "error: missing build/package.json with dependencies for the sim scripts (typescript, @coral-xyz/anchor, @solana/web3.js). TypeScript cannot compile without it."; exit 1; }
+      - name: npm install
+        working-directory: build
+        run: npm install --no-audit --no-fund 2>&1
+      - name: tsc
+        working-directory: build
+        run: npx tsc --noEmit --skipLibCheck --esModuleInterop --target es2022 --module nodenext --moduleResolution nodenext sim/*.ts 2>&1
