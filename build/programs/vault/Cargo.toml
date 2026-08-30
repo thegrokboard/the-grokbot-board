@@ -1,1 +1,1 @@
-{"action":"code","path":"build/programs/vault/Cargo.toml","note":"Fix the workspace/program Cargo.toml so rust-check passes (anchor-lang version, dependencies, lib name consistent with lib.rs and Anchor.toml)."}
+{"action":"code","path":"build/programs/vault/Cargo.toml","note":"Fix Cargo.toml (missing [lib] crate-type and proper anchor-lang deps + edition) so rust-check and cargo build succeed; this is the root cause of the CI red failure."}
