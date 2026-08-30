@@ -1,90 +1,78 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program, Wallet, AnchorProvider } from "@coral-xyz/anchor";
+import { Program, Wallet } from "@coral-xyz/anchor";
 import { Vault } from "../target/types/vault";
-import { Connection, PublicKey, Keypair, Transaction, SystemProgram } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
-export const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCP");
-export const PYTH_ORACLE_PROGRAM = new PublicKey("FsJ3A3u2vn5cTVofAjvy6y5kwAB41t7b4Uq1bK7b5b5j");
-export const JITO_SOL_PRICE_FEED = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCP"); // placeholder for real feed in sim
+// Re-export for lag-injector and others
+export { Vault };
 
-export interface PriceSeries {
+export interface OraclePrices {
+  jitoSolPrice: number;
+  timestamp: number;
   slot: number;
-  price: number; // scaled to 1e9
-  confidence: number;
 }
 
-export function getJitoSolPrice(series: PriceSeries[], slot: number): number | null {
-  const entry = series.find(s => s.slot === slot);
-  return entry ? entry.price : null;
-}
-
-export async function createTestOracle(
-  provider: AnchorProvider,
-  initialPrice: number
-): Promise<PublicKey> {
-  const oracleKeypair = Keypair.generate();
-  const lamports = await provider.connection.getMinimumBalanceForRentExemption(1024);
-
-  const tx = new Transaction().add(
-    SystemProgram.createAccount({
-      fromPubkey: provider.publicKey,
-      newAccountPubkey: oracleKeypair.publicKey,
-      lamports,
-      space: 1024,
-      programId: PYTH_ORACLE_PROGRAM,
-    })
-  );
-
-  await provider.sendAndConfirm(tx, [oracleKeypair]);
-  return oracleKeypair.publicKey;
-}
-
-export async function updateOraclePrice(
-  provider: AnchorProvider,
-  oracle: PublicKey,
-  price: number,
-  slot: number
-): Promise<void> {
-  // In real sim we would CPI to Pyth, here we just log for test-validator replay
-  console.log(`[oracle-utils] Simulated oracle update at slot ${slot}: $${price / 1e9}`);
-  // No-op for local test validator; lag-injector will drive real account data
-}
-
-export function createLagProvider(
+export const getJitoSolPrice = async (
   connection: Connection,
-  wallet: Wallet,
-  lagSlots: number = 90 // ~45s at 500ms/slot
-): AnchorProvider {
-  const payer = (wallet as any).payer || (wallet as any).secretKey 
-    ? wallet 
-    : (wallet as any).wallet;
+  oraclePubkey: PublicKey
+): Promise<OraclePrices> => {
+  // For the sim we replay historical JitoSOL prices.
+  // In a real deployment this would read a Switchboard or Pyth oracle.
+  // Here we return a placeholder that the lag injector will override.
+  const slot = await connection.getSlot();
+  return {
+    jitoSolPrice: 0.95, // default depeg value used by injector
+    timestamp: Date.now(),
+    slot,
+  };
+};
 
-  return new AnchorProvider(
-    connection,
-    wallet,
-    { commitment: "confirmed", preflightCommitment: "confirmed" }
+export const createProtectionBuffer = async (
+  program: Program<Vault>,
+  owner: Keypair,
+  vault: PublicKey,
+  bufferAmount: number
+): Promise<PublicKey> => {
+  const [bufferPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("protection_buffer"), vault.toBuffer()],
+    program.programId
   );
-}
 
-// Vault PDA helpers matching the on-chain program
-export function getVaultAuthority(vaultProgramId: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("authority")],
-    vaultProgramId
-  );
-}
+  // The buffer account is a simple token account holding jitoSOL as protection
+  await program.methods
+    .initializeBuffer(new anchor.BN(bufferAmount))
+    .accounts({
+      owner: owner.publicKey,
+      vault,
+      buffer: bufferPda,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      systemProgram: anchor.web3.SystemProgram.programId,
+    })
+    .signers([owner])
+    .rpc();
 
-export function getProtectionBuffer(vaultProgramId: PublicKey, owner: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("buffer"), owner.toBuffer()],
-    vaultProgramId
-  );
-}
+  return bufferPda;
+};
 
-export function getDrawdownAccount(vaultProgramId: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("drawdown")],
-    vaultProgramId
-  );
-}
+export const checkDrawdown = async (
+  program: Program<Vault>,
+  vault: PublicKey,
+  currentPrice: number,
+  twap: number
+): Promise<boolean> => {
+  const tx = await program.methods
+    .checkDrawdown(new anchor.BN(Math.floor(currentPrice * 1e9)), new anchor.BN(Math.floor(twap * 1e9)))
+    .accounts({
+      vault,
+    })
+    .rpc()
+    .catch((e) => {
+      if (e.toString().includes("DrawdownBreached")) {
+        return true;
+      }
+      throw e;
+    });
+
+  return typeof tx === "boolean" ? tx : false;
+};
