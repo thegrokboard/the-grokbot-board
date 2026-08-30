@@ -1,1 +1,30 @@
-{"action":"code","path":"build/programs/vault/Cargo.toml","note":"Fix Cargo.toml (missing [lib] crate-type and proper anchor-lang deps + edition) so rust-check and cargo build succeed; this is the root cause of the CI red failure."}
+[package]
+name = "vault"
+version = "0.1.0"
+description = "Onchain JitoSOL protection vault with drawdown circuit-breaker"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = { version = "0.29.0", features = ["init-if-needed"] }
+anchor-spl = { version = "0.29.0", features = ["spl-associated-token-account"] }
+solana-program = "1.18"
+jito-stake-pool = { version = "0.2", optional = true }
+thiserror = "1.0"
+
+[dev-dependencies]
+solana-program-test = "1.18"
+solana-sdk = "1.18"
+tokio = { version = "1", features = ["full"] }
+
+[workspace]
+members = ["."]
