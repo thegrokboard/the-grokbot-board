@@ -1,101 +1,89 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program, AnchorProvider, Wallet } from "@coral-xyz/anchor";
 import { Vault } from "../target/types/vault";
-import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
-import fs from "fs";
+import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
+import { readFileSync } from "fs";
 
-// Hard-coded replay of last three historical JitoSOL depeg price series (simplified for test harness)
-// Each entry: { slot: number, price: number } - price in lamports per JitoSOL (approx)
-const PRICE_SERIES = [
-  // Series 1: mild depeg
+// Hard-coded replay of the last three Jito depeg price series (slot, price in lamports)
+const REPLAY_SERIES = [
+  // series 1 - mild depeg
   [
-    { slot: 100, price: 0.98 },
-    { slot: 110, price: 0.95 },
-    { slot: 120, price: 0.92 },
-    { slot: 130, price: 0.89 },
+    { slot: 1000, price: 0.98e9 },
+    { slot: 1010, price: 0.95e9 },
+    { slot: 1025, price: 0.92e9 },
   ],
-  // Series 2: sharp depeg
+  // series 2 - sharp drawdown
   [
-    { slot: 200, price: 0.99 },
-    { slot: 205, price: 0.85 },
-    { slot: 210, price: 0.78 },
-    { slot: 215, price: 0.71 },
+    { slot: 2000, price: 0.99e9 },
+    { slot: 2015, price: 0.85e9 },
+    { slot: 2030, price: 0.78e9 },
   ],
-  // Series 3: recovery after depeg
+  // series 3 - recovery after depeg
   [
-    { slot: 300, price: 0.75 },
-    { slot: 310, price: 0.82 },
-    { slot: 320, price: 0.91 },
-    { slot: 330, price: 0.97 },
+    { slot: 3000, price: 0.80e9 },
+    { slot: 3020, price: 0.88e9 },
+    { slot: 3050, price: 0.97e9 },
   ],
 ];
 
-const ORACLE_LAG_SLOTS = 90; // ~45s at 0.5s/slot target
+async function main() {
+  // Use local test validator
+  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
 
-export async function runLagInjector(
-  provider: AnchorProvider,
-  vaultProgram: Program<Vault>,
-  oraclePubkey: PublicKey,
-  owner: Keypair
-): Promise<void> {
-  console.log("Starting lag injector replay with", ORACLE_LAG_SLOTS, "slot lag...");
+  // Load the payer from the default Anchor keypair (for test validator)
+  const payer = Keypair.fromSecretKey(
+    Uint8Array.from(JSON.parse(readFileSync("target/deploy/vault-keypair.json", "utf-8")))
+  );
 
-  const connection = provider.connection;
-  let currentSlot = await connection.getSlot();
+  const wallet = new Wallet(payer);
+  const provider = new AnchorProvider(connection, wallet, {
+    commitment: "confirmed",
+    preflightCommitment: "confirmed",
+  });
+  anchor.setProvider(provider);
 
-  for (const series of PRICE_SERIES) {
-    for (const tick of series) {
-      const targetSlot = tick.slot + ORACLE_LAG_SLOTS;
-      // Wait until we reach the lagged slot (sim harness runs against test validator)
-      while (true) {
-        currentSlot = await connection.getSlot();
-        if (currentSlot >= targetSlot) break;
-        await new Promise((r) => setTimeout(r, 50));
+  const programId = new PublicKey("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"); // placeholder - updated by anchor build
+  const program = new Program<Vault>(programId, provider);
+
+  console.log("Lag injector started. Replaying 3 JitoSOL depeg series with configurable oracle lag...");
+
+  const oracleLagSlots = 90; // ~45s at 400ms/slot target
+  const bufferPda = PublicKey.findProgramAddressSync(
+    [Buffer.from("buffer")],
+    program.programId
+  )[0];
+
+  for (let seriesIdx = 0; seriesIdx < REPLAY_SERIES.length; seriesIdx++) {
+    console.log(`\n=== Replaying series ${seriesIdx + 1} with ${oracleLagSlots} slot lag ===`);
+
+    for (const tick of REPLAY_SERIES[seriesIdx]) {
+      const laggedSlot = tick.slot + oracleLagSlots;
+
+      // Simulate feeding price via the drawdown circuit-breaker instruction
+      try {
+        const tx = await program.methods
+          .checkDrawdown(new anchor.BN(tick.price), new anchor.BN(laggedSlot))
+          .accounts({
+            buffer: bufferPda,
+            owner: provider.wallet.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .rpc();
+
+        console.log(`  slot ${tick.slot} (lagged ${laggedSlot}) price ${tick.price / 1e9} -> tx ${tx.slice(0, 8)}...`);
+      } catch (err: any) {
+        console.log(`  slot ${tick.slot} (lagged ${laggedSlot}) price ${tick.price / 1e9} -> breaker trip or error: ${err.message}`);
       }
 
-      // Simulate oracle update by calling the vault's update_price instruction (assumed in program)
-      const tx = await vaultProgram.methods
-        .updateOraclePrice(new anchor.BN(Math.floor(tick.price * 1_000_000_000))) // price as u64 scaled
-        .accounts({
-          oracle: oraclePubkey,
-          owner: owner.publicKey,
-        })
-        .signers([owner])
-        .rpc();
-
-      console.log(`Injected lagged price ${tick.price} at slot ${currentSlot} (orig ${tick.slot}) tx=${tx}`);
+      // Sleep to simulate real-time passage in sim
+      await new Promise((r) => setTimeout(r, 400));
     }
   }
 
-  console.log("Lag injector replay completed.");
+  console.log("\nLag injector replay completed. Check tick-runner.ts / twap-checker.ts for breaker vs false-positive stats.");
 }
 
-// For direct CLI usage
-if (require.main === module) {
-  (async () => {
-    const provider = anchor.AnchorProvider.env();
-    anchor.setProvider(provider);
-
-    const program = anchor.workspace.Vault as Program<Vault>;
-
-    // Load or generate test owner and oracle
-    let owner: Keypair;
-    const ownerPath = "target/owner.json";
-    if (fs.existsSync(ownerPath)) {
-      owner = Keypair.fromSecretKey(
-        Uint8Array.from(JSON.parse(fs.readFileSync(ownerPath, "utf-8")))
-      );
-    } else {
-      owner = Keypair.generate();
-      fs.writeFileSync(ownerPath, JSON.stringify(Array.from(owner.secretKey)));
-    }
-
-    // In test harness the oracle is typically a PDA or configured account
-    const [oraclePda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("oracle")],
-      program.programId
-    );
-
-    await runLagInjector(provider, program, oraclePda, owner);
-  })().catch(console.error);
-}
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
