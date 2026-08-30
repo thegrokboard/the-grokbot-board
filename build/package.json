@@ -1,1 +1,29 @@
-{"action":"code","path":"build/package.json","note":"Fix package.json with valid JSON syntax, correct devDependencies including typescript, @coral-xyz/anchor, @solana/web3.js, @solana/spl-token, ts-node, and scripts for build/check so ts-check passes and sim scripts compile"}
+{
+  "name": "jito-vault-sim",
+  "version": "0.1.0",
+  "description": "Pure onchain Anchor test-validator sim harness for JitoSOL depeg circuit breaker",
+  "private": true,
+  "scripts": {
+    "build": "anchor build",
+    "test": "anchor test",
+    "sim": "ts-node sim/tick-runner.ts",
+    "check": "tsc --noEmit",
+    "lint": "eslint . --ext .ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.29.0",
+    "@solana/web3.js": "^1.95.0",
+    "@solana/spl-token": "^0.4.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.0",
+    "eslint": "^8.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
