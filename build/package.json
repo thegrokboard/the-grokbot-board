@@ -1,1 +1,23 @@
-{"action":"code","path":"build/package.json","note":"Fix root package.json with valid JSON, correct dev deps (typescript, @coral-xyz/anchor, @solana/web3.js, @solana/web3.js), and npm scripts so ts-check passes and the full sim harness builds"}
+{
+  "name": "jito-vault-sim",
+  "version": "0.1.0",
+  "description": "Pure onchain Anchor test-validator sim harness for JitoSOL depeg protection",
+  "private": true,
+  "scripts": {
+    "ts-check": "tsc --noEmit",
+    "build": "anchor build",
+    "test": "anchor test",
+    "sim": "ts-node sim/tick-runner.ts",
+    "lag-inject": "ts-node sim/lag-injector.ts",
+    "twap-check": "ts-node sim/twap-checker.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.29.0",
+    "@solana/web3.js": "^1.95.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "ts-node": "^10.9.2",
+    "@types/node": "^20.0.0"
+  }
+}
