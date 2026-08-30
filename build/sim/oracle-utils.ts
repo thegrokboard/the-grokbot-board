@@ -1,100 +1,84 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program, Wallet, AnchorProvider } from "@coral-xyz/anchor";
+import { Program, AnchorProvider, Wallet } from "@coral-xyz/anchor";
+import { Connection, PublicKey, Keypair, SystemProgram, Transaction } from "@solana/web3.js";
 import { Vault } from "../target/types/vault";
-import { Connection, PublicKey, Keypair, SystemProgram, Transaction, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID, createAssociatedTokenAccountInstruction, getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction } from "@solana/spl-token";
 
-export const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Yg5pL");
-export const PYTH_JITO_SOL_PRICE_FEED = new PublicKey("Gck2o8a2J4jPq3v2y4f4w7qJ8j8z5z5z5z5z5z5z5z"); // placeholder for sim
-
-export interface PriceTick {
-  price: number;
-  slot: number;
+export interface OraclePrices {
+  jitoSolPrice: number;
   timestamp: number;
+  slot: number;
 }
 
-export function getJitoSolPrice(connection: Connection, priceFeed: PublicKey): Promise<number> {
-  // For sim we return a mocked value; in real harness this would read Pyth
-  return Promise.resolve(0.92); // default depeg sim value
-}
-
-export async function createTestVault(provider: AnchorProvider): Promise<{
-  program: Program<Vault>;
-  vault: PublicKey;
-  buffer: PublicKey;
-  owner: Keypair;
-}> {
-  const program = new Program<Vault>(
-    require("../target/idl/vault.json"),
-    provider
-  );
-
-  const owner = Keypair.generate();
-  const vault = anchor.web3.PublicKey.findProgramAddressSync(
-    [Buffer.from("vault"), owner.publicKey.toBuffer()],
-    program.programId
-  )[0];
-
-  const buffer = anchor.web3.PublicKey.findProgramAddressSync(
-    [Buffer.from("buffer"), vault.toBuffer()],
-    program.programId
-  )[0];
-
-  // Fund owner
-  const tx = new Transaction().add(
-    SystemProgram.transfer({
-      fromPubkey: provider.publicKey,
-      toPubkey: owner.publicKey,
-      lamports: 10 * anchor.web3.LAMPORTS_PER_SOL,
-    })
-  );
-  await provider.sendAndConfirm(tx);
-
-  return { program, vault, buffer, owner };
-}
-
-export async function setupJitoSolATA(
+export async function getJitoSolPrice(
   connection: Connection,
-  payer: Keypair,
-  owner: PublicKey
-): Promise<PublicKey> {
-  const ata = getAssociatedTokenAddressSync(JITO_SOL_MINT, owner);
-  const accountInfo = await connection.getAccountInfo(ata);
+  jitoSolMint: PublicKey = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCP"),
+  oracleFeed: PublicKey = new PublicKey("8V9Y9yYac6Y7kGCPj1toso1uCk3RLmjorhTtrVw") // placeholder for sim
+): Promise<OraclePrices> {
+  // For simulation replay we return synthetic prices; real impl would read Pyth/Switchboard
+  const slot = await connection.getSlot();
+  const timestamp = Math.floor(Date.now() / 1000);
   
-  if (!accountInfo) {
-    const tx = new Transaction().add(
-      createAssociatedTokenAccountInstruction(
-        payer.publicKey,
-        ata,
-        owner,
-        JITO_SOL_MINT
-      )
-    );
-    await anchor.web3.sendAndConfirmTransaction(connection, tx, [payer]);
-  }
+  // Simulated depeg series for testing (will be driven by lag-injector)
+  const basePrice = 0.95 + (Math.sin(timestamp / 3600) * 0.08);
+  const price = Math.max(0.75, Math.min(1.05, basePrice));
   
-  return ata;
-}
-
-export function createLagInjector(
-  basePrices: PriceTick[],
-  lagSlots: number = 180 // ~45s at 4Hz
-): (currentSlot: number) => number {
-  return (currentSlot: number) => {
-    const laggedSlot = Math.max(0, currentSlot - lagSlots);
-    const tick = basePrices.find(t => t.slot >= laggedSlot) || basePrices[basePrices.length - 1];
-    return tick.price;
+  return {
+    jitoSolPrice: price,
+    timestamp,
+    slot,
   };
 }
 
-export async function advanceSlots(
-  connection: Connection,
-  slots: number
-): Promise<number> {
-  const currentSlot = await connection.getSlot();
-  // In test validator we use clock manipulation via syscall or just wait
-  for (let i = 0; i < slots; i++) {
-    await new Promise(resolve => setTimeout(resolve, 50));
-  }
-  return currentSlot + slots;
+export function createLagInjectedPrice(
+  basePrice: number,
+  lagSlots: number,
+  currentSlot: number
+): OraclePrices {
+  const lagFactor = Math.max(0, 1 - (lagSlots / 200)); // 45s ~90 slots at 0.5s/slot
+  const injectedPrice = basePrice * (0.85 + lagFactor * 0.2);
+  
+  return {
+    jitoSolPrice: Math.max(0.6, injectedPrice),
+    timestamp: Math.floor(Date.now() / 1000),
+    slot: currentSlot,
+  };
+}
+
+export async function setupVaultProvider(): Promise<{
+  provider: AnchorProvider;
+  program: Program<Vault>;
+  payer: Keypair;
+}> {
+  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
+  
+  // Use default test validator keypair for sim
+  const payer = Keypair.fromSecretKey(
+    new Uint8Array([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]) // placeholder - in practice loaded from env
+  );
+  
+  const wallet = new Wallet(payer);
+  const provider = new AnchorProvider(connection, wallet, {
+    commitment: "confirmed",
+    preflightCommitment: "confirmed",
+  });
+  anchor.setProvider(provider);
+  
+  const program = anchor.workspace.Vault as Program<Vault>;
+  
+  return { provider, program, payer };
+}
+
+export function getVaultPdas(programId: PublicKey, owner: PublicKey) {
+  const [vaultPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault"), owner.toBuffer()],
+    programId
+  );
+  
+  const [bufferPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("protection_buffer"), vaultPda.toBuffer()],
+    programId
+  );
+  
+  return { vaultPda, bufferPda };
 }
