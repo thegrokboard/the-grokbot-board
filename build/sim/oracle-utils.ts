@@ -1,95 +1,100 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program, AnchorProvider, Wallet } from "@coral-xyz/anchor";
+import { Program, Wallet, AnchorProvider } from "@coral-xyz/anchor";
 import { Vault } from "../target/types/vault";
-import { Connection, PublicKey, Keypair, SystemProgram, Transaction } from "@solana/web3.js";
-import { createMint, getOrCreateAssociatedTokenAccount, mintTo } from "@solana/spl-token";
+import { Connection, PublicKey, Keypair, SystemProgram, Transaction, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID, createAssociatedTokenAccountInstruction, getAssociatedTokenAddressSync } from "@solana/spl-token";
 
-export interface OraclePrices {
-  jitoSolPrice: number;
-  timestamp: number;
+export const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Yg5pL");
+export const PYTH_JITO_SOL_PRICE_FEED = new PublicKey("Gck2o8a2J4jPq3v2y4f4w7qJ8j8z5z5z5z5z5z5z5z"); // placeholder for sim
+
+export interface PriceTick {
+  price: number;
   slot: number;
+  timestamp: number;
 }
 
-export async function getJitoSolPrice(connection: Connection, oraclePubkey: PublicKey): Promise<OraclePrices> {
-  // In test validator sim we read from a simple account that the lag injector updates.
-  // For realism the real deployment would use Switchboard or Pyth; here we use a mock.
-  const accountInfo = await connection.getAccountInfo(oraclePubkey);
-  if (!accountInfo || accountInfo.data.length < 16) {
-    return { jitoSolPrice: 0.9, timestamp: Date.now(), slot: 0 };
+export function getJitoSolPrice(connection: Connection, priceFeed: PublicKey): Promise<number> {
+  // For sim we return a mocked value; in real harness this would read Pyth
+  return Promise.resolve(0.92); // default depeg sim value
+}
+
+export async function createTestVault(provider: AnchorProvider): Promise<{
+  program: Program<Vault>;
+  vault: PublicKey;
+  buffer: PublicKey;
+  owner: Keypair;
+}> {
+  const program = new Program<Vault>(
+    require("../target/idl/vault.json"),
+    provider
+  );
+
+  const owner = Keypair.generate();
+  const vault = anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("vault"), owner.publicKey.toBuffer()],
+    program.programId
+  )[0];
+
+  const buffer = anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("buffer"), vault.toBuffer()],
+    program.programId
+  )[0];
+
+  // Fund owner
+  const tx = new Transaction().add(
+    SystemProgram.transfer({
+      fromPubkey: provider.publicKey,
+      toPubkey: owner.publicKey,
+      lamports: 10 * anchor.web3.LAMPORTS_PER_SOL,
+    })
+  );
+  await provider.sendAndConfirm(tx);
+
+  return { program, vault, buffer, owner };
+}
+
+export async function setupJitoSolATA(
+  connection: Connection,
+  payer: Keypair,
+  owner: PublicKey
+): Promise<PublicKey> {
+  const ata = getAssociatedTokenAddressSync(JITO_SOL_MINT, owner);
+  const accountInfo = await connection.getAccountInfo(ata);
+  
+  if (!accountInfo) {
+    const tx = new Transaction().add(
+      createAssociatedTokenAccountInstruction(
+        payer.publicKey,
+        ata,
+        owner,
+        JITO_SOL_MINT
+      )
+    );
+    await anchor.web3.sendAndConfirmTransaction(connection, tx, [payer]);
   }
-  const price = accountInfo.data.readDoubleLE(0);
-  const ts = accountInfo.data.readBigUInt64LE(8);
-  const slot = await connection.getSlot();
-  return {
-    jitoSolPrice: price,
-    timestamp: Number(ts),
-    slot,
+  
+  return ata;
+}
+
+export function createLagInjector(
+  basePrices: PriceTick[],
+  lagSlots: number = 180 // ~45s at 4Hz
+): (currentSlot: number) => number {
+  return (currentSlot: number) => {
+    const laggedSlot = Math.max(0, currentSlot - lagSlots);
+    const tick = basePrices.find(t => t.slot >= laggedSlot) || basePrices[basePrices.length - 1];
+    return tick.price;
   };
 }
 
-export function createTestJitoSolMint(provider: AnchorProvider): Promise<PublicKey> {
-  const wallet = provider.wallet as Wallet;
-  const connection = provider.connection;
-  return createMint(
-    connection,
-    wallet.payer,
-    wallet.publicKey,
-    wallet.publicKey,
-    9
-  );
-}
-
-export async function fundTestJitoSol(
-  provider: AnchorProvider,
-  mint: PublicKey,
-  destination: PublicKey,
-  amount: number
-): Promise<void> {
-  const wallet = provider.wallet as Wallet;
-  const connection = provider.connection;
-  const ata = await getOrCreateAssociatedTokenAccount(
-    connection,
-    wallet.payer,
-    mint,
-    destination
-  );
-  await mintTo(
-    connection,
-    wallet.payer,
-    mint,
-    ata.address,
-    wallet.payer,
-    amount * 1_000_000_000
-  );
-}
-
-export async function updateOracle(
-  provider: AnchorProvider,
-  oraclePubkey: PublicKey,
-  price: number
-): Promise<void> {
-  const wallet = provider.wallet as Wallet;
-  const connection = provider.connection;
-  const data = Buffer.alloc(16);
-  data.writeDoubleLE(price, 0);
-  data.writeBigUInt64LE(BigInt(Date.now()), 8);
-  const tx = new Transaction().add(
-    SystemProgram.transfer({
-      fromPubkey: wallet.publicKey,
-      toPubkey: oraclePubkey,
-      lamports: 0,
-    })
-  );
-  // overwrite the account data directly (test-validator only)
-  await provider.sendAndConfirm(tx);
-  const account = await connection.getAccountInfo(oraclePubkey);
-  if (account) {
-    const newData = Buffer.concat([data, account.data.slice(16)]);
-    await connection.requestAirdrop(oraclePubkey, 0); // dummy to keep alive
-    // In a real sim we would use setAccount, but for CI we just log.
-    console.log(`Oracle updated to price ${price}`);
+export async function advanceSlots(
+  connection: Connection,
+  slots: number
+): Promise<number> {
+  const currentSlot = await connection.getSlot();
+  // In test validator we use clock manipulation via syscall or just wait
+  for (let i = 0; i < slots; i++) {
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
+  return currentSlot + slots;
 }
-
-export const DEFAULT_ORACLE = new PublicKey("11111111111111111111111111111112");
-export const DEFAULT_JITO_MINT = new PublicKey("J1T0S0L1111111111111111111111111111111111");
