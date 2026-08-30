@@ -4,21 +4,20 @@
   "description": "Pure onchain Anchor test-validator sim harness for JitoSOL depeg protection",
   "private": true,
   "scripts": {
+    "build": "anchor build",
+    "test": "anchor test",
     "ts-check": "tsc --noEmit",
     "sim": "ts-node sim/tick-runner.ts",
-    "build": "anchor build",
-    "test": "anchor test"
+    "inject": "ts-node sim/lag-injector.ts",
+    "check-twap": "ts-node sim/twap-checker.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.29.0",
-    "@solana/web3.js": "^1.91.0"
+    "@solana/web3.js": "^1.95.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "typescript": "^5.0.0",
-    "ts-node": "^10.9.0"
-  },
-  "engines": {
-    "node": ">=18"
+    "ts-node": "^10.9.2",
+    "typescript": "^5.0.0"
   }
 }
