@@ -1,22 +1,24 @@
 {
   "name": "jito-vault-sim",
   "version": "0.1.0",
-  "description": "Pure onchain Anchor test-validator sim for JitoSOL depeg circuit breaker",
+  "description": "Pure onchain Anchor test-validator sim harness for JitoSOL depeg protection",
   "private": true,
   "scripts": {
-    "ts-check": "tsc --noEmit",
-    "build": "tsc",
-    "sim": "ts-node sim/tick-runner.ts",
-    "test": "anchor test"
+    "build": "anchor build",
+    "test": "anchor test",
+    "sim:build": "tsc -p tsconfig.json",
+    "sim:check": "tsc --noEmit -p tsconfig.json",
+    "sim:run": "ts-node sim/tick-runner.ts",
+    "lint": "eslint . --ext .ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.29.0",
-    "@solana/web3.js": "^1.95.0",
-    "@types/node": "^22.0.0"
+    "@solana/web3.js": "^1.95.0"
   },
   "devDependencies": {
-    "typescript": "^5.5.0",
-    "ts-node": "^10.9.2"
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.0.0"
   },
   "engines": {
     "node": ">=18"
