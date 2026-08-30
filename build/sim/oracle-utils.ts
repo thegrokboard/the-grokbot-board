@@ -1,87 +1,134 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program, AnchorProvider, Wallet, Idl } from "@coral-xyz/anchor";
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair, SystemProgram } from "@solana/web3.js";
 import { Vault } from "../target/types/vault";
 
 export interface OraclePrices {
-  prices: Array<{
-    timestamp: number;
-    price: number; // in USD, scaled to 1e9 for precision
-  }>;
+  jitoSolPrice: number;
+  timestamp: number;
+  slot: number;
 }
 
-export const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn");
-export const PYTH_JITO_SOL_PRICE_FEED = new PublicKey("2k4h1v7X9kT9zQJ8vP5zJqK7kP5zJqK7kP5zJqK7kP"); // placeholder for sim
+export const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCP");
+export const PYTH_JITO_SOL_PRICE_FEED = new PublicKey("3fJ7v6fZ3q4v6f3fY3q4v6f3fY3q4v6f3fY3q4v6f3f"); // placeholder for sim
 
-// Historical JitoSOL depeg series (last three observed depegs, simplified for replay)
-const REPLAY_SERIES: OraclePrices = {
-  prices: [
-    // Series 1: minor depeg
-    { timestamp: 1720000000, price: 0.98e9 },
-    { timestamp: 1720000060, price: 0.95e9 },
-    { timestamp: 1720000120, price: 0.92e9 },
-    { timestamp: 1720000180, price: 0.89e9 },
-    { timestamp: 1720000240, price: 0.95e9 },
-    // Series 2: sharp depeg
-    { timestamp: 1720100000, price: 0.99e9 },
-    { timestamp: 1720100060, price: 0.85e9 },
-    { timestamp: 1720100120, price: 0.78e9 },
-    { timestamp: 1720100180, price: 0.82e9 },
-    { timestamp: 1720100240, price: 0.97e9 },
-    // Series 3: prolonged drawdown
-    { timestamp: 1720200000, price: 1.00e9 },
-    { timestamp: 1720200300, price: 0.94e9 },
-    { timestamp: 1720200600, price: 0.88e9 },
-    { timestamp: 1720200900, price: 0.81e9 },
-    { timestamp: 1720201200, price: 0.79e9 },
-    { timestamp: 1720201500, price: 0.85e9 },
-  ],
-};
-
-export function getJitoSOLPrice(ts: number): number {
-  // simple linear interpolation over replay data
-  const sorted = [...REPLAY_SERIES.prices].sort((a, b) => a.timestamp - b.timestamp);
-  for (let i = 0; i < sorted.length - 1; i++) {
-    if (ts >= sorted[i].timestamp && ts <= sorted[i + 1].timestamp) {
-      const t0 = sorted[i].timestamp;
-      const t1 = sorted[i + 1].timestamp;
-      const p0 = sorted[i].price;
-      const p1 = sorted[i + 1].price;
-      return p0 + ((p1 - p0) * (ts - t0)) / (t1 - t0);
-    }
-  }
-  return sorted[sorted.length - 1].price;
+export function loadVaultProgram(provider: AnchorProvider): Program<Vault> {
+  const idl = require("../target/idl/vault.json");
+  return new Program(idl as Idl, provider);
 }
 
-export function createLagProvider(
+export async function getJitoSolPrice(
   connection: Connection,
-  wallet: Wallet,
-  lagSlots: number = 150 // ~45s at 300ms/slot
+  oraclePubkey: PublicKey = PYTH_JITO_SOL_PRICE_FEED
+): Promise<OraclePrices> {
+  // Simulate realistic price fetch with slot timing (for replay)
+  const slot = await connection.getSlot();
+  const timestamp = Math.floor(Date.now() / 1000);
+  
+  // Default to ~1.0 with small variance for testing depegs
+  let price = 1.0;
+  const variance = (Math.random() - 0.5) * 0.05;
+  price = Math.max(0.7, Math.min(1.3, price + variance));
+  
+  return {
+    jitoSolPrice: price,
+    timestamp,
+    slot,
+  };
+}
+
+export function createLagInjectorProvider(
+  connection: Connection,
+  wallet: Keypair,
+  lagSlots: number = 225 // ~45s at 200ms/slot
 ): AnchorProvider {
+  const anchorWallet = new Wallet(wallet);
   const provider = new AnchorProvider(
     connection,
-    wallet,
-    { commitment: "confirmed" }
+    anchorWallet,
+    { commitment: "confirmed", preflightCommitment: "confirmed" }
   );
-
-  // Wrap to inject oracle lag (for sim only)
-  const originalRpcRequest = (provider as any).connection._rpcRequest;
-  (provider as any).connection._rpcRequest = async (method: string, args: any[]) => {
-    if (method === "getAccountInfo" && args[0] === PYTH_JITO_SOL_PRICE_FEED.toString()) {
-      // simulate lag by using older price (handled in oracle-utils caller)
-      await new Promise((r) => setTimeout(r, 100));
+  
+  // Monkey-patch to simulate lag by delaying oracle reads
+  const originalGetAccountInfo = connection.getAccountInfo.bind(connection);
+  connection.getAccountInfo = async (pubkey: PublicKey, commitment?: any) => {
+    if (pubkey.equals(PYTH_JITO_SOL_PRICE_FEED)) {
+      await new Promise((r) => setTimeout(r, 200)); // simulate lag
     }
-    return originalRpcRequest ? originalRpcRequest.call((provider as any).connection, method, args) : null;
+    return originalGetAccountInfo(pubkey, commitment);
   };
-
+  
   return provider;
 }
 
-export async function loadVaultProgram(provider: AnchorProvider): Promise<Program<Vault>> {
-  const idl = (await anchor.Program.fetchIdl(
-    new PublicKey("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"), // placeholder program ID
-    provider
-  )) as Idl;
+export async function setupTestVault(
+  provider: AnchorProvider,
+  owner: Keypair
+): Promise<{
+  vault: PublicKey;
+  buffer: PublicKey;
+  program: Program<Vault>;
+}> {
+  const program = loadVaultProgram(provider);
+  
+  const [vault] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault"), owner.publicKey.toBuffer()],
+    program.programId
+  );
+  
+  const [buffer] = PublicKey.findProgramAddressSync(
+    [Buffer.from("protection_buffer"), vault.toBuffer()],
+    program.programId
+  );
+  
+  // Initialize if needed (idempotent in sim)
+  try {
+    await program.methods
+      .initialize()
+      .accounts({
+        vault,
+        owner: owner.publicKey,
+        buffer,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([owner])
+      .rpc();
+  } catch (e) {
+    // Already initialized is ok in replay
+    if (!e.toString().includes("already in use")) {
+      console.warn("Vault init warning:", e);
+    }
+  }
+  
+  return { vault, buffer, program };
+}
 
-  return new Program(idl as any, provider) as Program<Vault>;
+export function generateDepegSeries(
+  basePrice: number = 1.0,
+  length: number = 30,
+  depegAt: number = 15,
+  depegSeverity: number = 0.35
+): OraclePrices[] {
+  const series: OraclePrices[] = [];
+  const now = Math.floor(Date.now() / 1000);
+  
+  for (let i = 0; i < length; i++) {
+    let price = basePrice;
+    const slot = 100000 + i * 5;
+    
+    if (i >= depegAt) {
+      const progress = (i - depegAt) / (length - depegAt);
+      price = basePrice * (1 - depegSeverity * Math.min(1, progress * 1.8));
+    } else {
+      price += (Math.sin(i) * 0.02);
+    }
+    
+    series.push({
+      jitoSolPrice: Math.max(0.6, price),
+      timestamp: now - (length - i) * 15,
+      slot,
+    });
+  }
+  
+  return series;
 }
