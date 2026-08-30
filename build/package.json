@@ -1,1 +1,24 @@
-{"action":"code","path":"build/package.json","note":"Fix package.json with valid JSON syntax, correct dependencies for typescript compilation, and scripts to make ts-check pass (fixes the TS1005 parse errors from malformed import statements in sim files)."}
+{
+  "name": "jito-vault-sim",
+  "version": "0.1.0",
+  "description": "Pure onchain Anchor sim harness for JitoSOL depeg circuit breaker",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "ts-check": "tsc --noEmit",
+    "sim": "ts-node sim/tick-runner.ts",
+    "test": "anchor test"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.29.0",
+    "@solana/web3.js": "^1.95.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
