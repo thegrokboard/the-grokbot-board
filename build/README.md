@@ -1,24 +1,23 @@
-# MandateVault JitoSOL Depeg Protection Sim Harness
+# MandateVault JitoSOL Depeg Protection Simulator
 
-Pure on-chain Anchor + test-validator simulation of the JitoSOL drawdown circuit-breaker.
+Pure on-chain Anchor test-validator simulation harness that replays real historical JitoSOL depeg price series with configurable oracle lag to test a circuit-breaker vault.
 
-This harness replays the last three historical Jito depeg events with configurable oracle lag (target 45s) and runs a 15s TWAP false-positive checker. A 7-day tick runner drives the full simulation and logs breaker trips vs false positives.
+## Architecture
 
-## Components
+- **Program**: `vault` (Rust/Anchor) – accepts jitoSOL deposits, maintains a protection buffer PDA, implements a drawdown circuit-breaker instruction based on 15s TWAP, plus owner pause/withdraw.
+- **lag-injector.ts**: Replays the last three historical Jito depeg price series against a local test validator. Injects prices with a configurable oracle lag (default target 45s, slot-exact).
+- **twap-checker.ts**: Runs a 15-second TWAP false-positive checker over the replayed series to detect breaker trips vs false positives.
+- **tick-runner.ts**: 7-day tick runner that drives the entire simulation end-to-end using the injector + checker, logs breaker trips, false positives, and final stats.
+- **Test Validator**: Runs with Anchor's localnet, custom clock, and pre-funded accounts.
 
-- **Anchor vault program** (`programs/vault`): Implements jitoSOL deposits into a protection buffer PDA, owner-controlled pause/withdraw, and drawdown circuit-breaker instruction using a 15s TWAP.
-- **lag-injector.ts**: Replays historical Jito price series against a local test validator, injecting oracle updates with a configurable slot-exact lag.
-- **twap-checker.ts**: 15-second TWAP false-positive detector that runs over the replayed series.
-- **tick-runner.ts**: 7-day simulation driver that orchestrates the injector, checker, and on-chain program, logging breaker behavior.
+The simulation is fully deterministic and runs entirely against a local `solana-test-validator`.
 
 ## Prerequisites
 
-- Rust (stable)
-- Anchor CLI (`cargo install --git https://github.com/coral-xyz/anchor anchor-cli --locked`)
-- Node.js 18+ and Yarn
-- solana-test-validator (from Solana CLI)
+- Node.js >= 18
+- Rust (cargo)
+- Anchor CLI >= 0.29.0 (`avm install latest`)
+- Solana CLI >= 1.18
 
-## Exact Run Instructions
+## Quick Start
 
-1. **Build the project**
-   
