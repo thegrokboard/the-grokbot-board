@@ -1,29 +1,22 @@
-# MandateVault JitoSOL Depeg Protection Sim Harness
+# MandateVault JitoSOL Depeg Protection Simulator
 
-Pure on-chain Anchor test-validator simulation that replays real historical Jito depeg price series with configurable oracle lag to test a drawdown circuit-breaker.
+Pure on-chain Anchor test-validator simulation harness that replays historical JitoSOL depeg events with configurable oracle lag to test a drawdown circuit-breaker.
 
 ## Components
-
 - **Anchor Vault Program** (`programs/vault`): Rust on-chain logic with:
-  - jitoSOL deposits into protected vault
-  - Protection buffer PDA
-  - Drawdown circuit-breaker instruction (15s TWAP trigger)
-  - Owner pause + emergency withdraw
-
-- **Lag Injector** (`sim/lag-injector.ts`): Replays the last three real Jito depeg price series against a local test validator. Injects oracle updates with a configurable lag (default 45s, slot-exact).
-
-- **TWAP False-Positive Checker** (`sim/twap-checker.ts`): Runs 15-second TWAP logic over the replayed series to detect breaker trips vs false positives.
-
-- **7-Day Tick Runner** (`sim/tick-runner.ts`): Drives the full simulation by advancing the test validator slot-by-slot, feeding lagged prices, and logging breaker behavior over a simulated 7-day period.
+  - jitoSOL deposits into a protected vault
+  - Protection buffer PDA holding collateral
+  - Drawdown circuit-breaker instruction (15s TWAP-based)
+  - Owner pause / emergency withdraw
+- **Lag Injector** (`sim/lag-injector.ts`): Replays the last three real Jito depeg price series against the local test validator with a configurable oracle lag (default 45s, slot-exact).
+- **TWAP False-Positive Checker** (`sim/twap-checker.ts`): Runs a 15-second TWAP over the replayed series and detects breaker trips vs false positives.
+- **7-Day Tick Runner** (`sim/tick-runner.ts`): Drives the full simulation end-to-end, advancing the test validator slot-by-slot while injecting lagged prices.
 
 ## Prerequisites
-
+- Node.js >= 18
 - Rust (stable)
-- Anchor CLI v0.29.0+
-- Node.js 18+ and Yarn
-- solana-test-validator (installed with Solana CLI)
+- Anchor CLI (`cargo install --git https://github.com/coral-xyz/anchor anchor-cli --locked`)
+- Solana CLI (`sh -c "$(curl -sSfL https://release.solana.com/stable/install)"`)
 
-## Exact Run Instructions
+## Setup
 
-1. **Build the project**
-   
