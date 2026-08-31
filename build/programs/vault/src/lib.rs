@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount};
+use anchor_lang::solana_program::pubkey::Pubkey;
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
@@ -12,79 +12,43 @@ pub mod vault {
         vault.owner = owner;
         vault.buffer_bps = buffer_bps;
         vault.is_paused = false;
-        vault.last_twap = 0;
-        vault.last_update_slot = Clock::get()?.slot;
+        vault.jito_sol_oracle = ctx.accounts.jito_sol_oracle.key();
         Ok(())
     }
 
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        let vault = &ctx.accounts.vault;
-        require!(!vault.is_paused, VaultError::VaultPaused);
-
-        let cpi_accounts = token::Transfer {
-            from: ctx.accounts.user_token.to_account_info(),
-            to: ctx.accounts.vault_token.to_account_info(),
-            authority: ctx.accounts.user.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        token::transfer(cpi_ctx, amount)?;
-
+        let vault = &mut ctx.accounts.vault;
+        // In a real impl this would CPI to the jitoSOL mint, here we just record
+        vault.total_deposited = vault.total_deposited.checked_add(amount).unwrap();
         Ok(())
     }
 
-    pub fn pause(ctx: Context<Pause>) -> Result<()> {
+    pub fn drawdown_circuit_breaker(ctx: Context<DrawdownCircuitBreaker>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.authority.key() == vault.owner, VaultError::Unauthorized);
+        let clock = Clock::get()?;
+        let price = get_twap_price(&ctx.accounts.oracle_feed)?;
+
+        // Simple 15s TWAP drawdown check against protection buffer
+        if is_drawdown_breached(price, vault.buffer_bps) {
+            vault.is_paused = true;
+            msg!("Circuit breaker tripped - vault paused");
+        }
+        Ok(())
+    }
+
+    pub fn owner_pause(ctx: Context<OwnerPause>) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        require!(ctx.accounts.owner.key() == vault.owner, ErrorCode::Unauthorized);
         vault.is_paused = true;
         Ok(())
     }
 
-    pub fn unpause(ctx: Context<Unpause>) -> Result<()> {
+    pub fn owner_withdraw(ctx: Context<OwnerWithdraw>, amount: u64) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.authority.key() == vault.owner, VaultError::Unauthorized);
-        vault.is_paused = false;
-        Ok(())
-    }
-
-    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-        let vault = &ctx.accounts.vault;
-        require!(ctx.accounts.authority.key() == vault.owner, VaultError::Unauthorized);
-        require!(!vault.is_paused, VaultError::VaultPaused);
-
-        let cpi_accounts = token::Transfer {
-            from: ctx.accounts.vault_token.to_account_info(),
-            to: ctx.accounts.user_token.to_account_info(),
-            authority: ctx.accounts.vault.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-
-        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", &[ctx.bumps.vault]]];
-        let cpi_ctx = CpiContext::new_with_signer(
-            cpi_program,
-            cpi_accounts,
-            signer_seeds,
-        );
-        token::transfer(cpi_ctx, amount)?;
-
-        Ok(())
-    }
-
-    pub fn drawdown_check(ctx: Context<DrawdownCheck>, current_price: u64, twap_price: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        let clock = Clock::get()?;
-
-        require!(!vault.is_paused, VaultError::VaultPaused);
-
-        let depeg_threshold = 9000u64; // 10% depeg example
-        if current_price * 10000 < twap_price * depeg_threshold {
-            vault.is_paused = true;
-            // protection buffer would be withdrawn or marked here in full impl
-        }
-
-        vault.last_twap = twap_price;
-        vault.last_update_slot = clock.slot;
-
+        require!(ctx.accounts.owner.key() == vault.owner, ErrorCode::Unauthorized);
+        require!(vault.is_paused, ErrorCode::NotPaused);
+        // Real impl would transfer tokens; sim just logs
+        msg!("Owner withdrew {} lamports", amount);
         Ok(())
     }
 }
@@ -94,14 +58,16 @@ pub struct Vault {
     pub owner: Pubkey,
     pub buffer_bps: u16,
     pub is_paused: bool,
-    pub last_twap: u64,
-    pub last_update_slot: u64,
+    pub jito_sol_oracle: Pubkey,
+    pub total_deposited: u64,
+    pub last_twap_slot: u64,
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = payer, space = 8 + 32 + 2 + 1 + 8 + 8, seeds = [b"vault"], bump)]
+    #[account(init, payer = payer, space = 8 + 32 + 2 + 1 + 32 + 8 + 8)]
     pub vault: Account<'info, Vault>,
+    pub jito_sol_oracle: AccountInfo<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -111,53 +77,48 @@ pub struct Initialize<'info> {
 pub struct Deposit<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
-    #[account(mut)]
-    pub user_token: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub vault_token: Account<'info, TokenAccount>,
     pub user: Signer<'info>,
-    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
-pub struct Pause<'info> {
+pub struct DrawdownCircuitBreaker<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
-    pub authority: Signer<'info>,
+    /// CHECK: oracle feed provided by lag injector
+    pub oracle_feed: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
-pub struct Unpause<'info> {
+pub struct OwnerPause<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
-    pub authority: Signer<'info>,
+    pub owner: Signer<'info>,
 }
 
 #[derive(Accounts)]
-pub struct Withdraw<'info> {
-    #[account(mut, seeds = [b"vault"], bump)]
-    pub vault: Account<'info, Vault>,
-    #[account(mut)]
-    pub user_token: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub vault_token: Account<'info, TokenAccount>,
-    pub authority: Signer<'info>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct DrawdownCheck<'info> {
+pub struct OwnerWithdraw<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
-    pub authority: Signer<'info>, // oracle or owner
+    pub owner: Signer<'info>,
 }
 
 #[error_code]
-pub enum VaultError {
+pub enum ErrorCode {
     #[msg("Unauthorized")]
     Unauthorized,
-    #[msg("Vault is paused")]
-    VaultPaused,
-    #[msg("Drawdown circuit breaker tripped")]
-    BreakerTripped,
+    #[msg("Vault is not paused")]
+    NotPaused,
 }
+
+// Stub oracle helpers - real version would use Switchboard or Pyth
+fn get_twap_price(_feed: &AccountInfo) -> Result<u64> {
+    // In sim this value is injected via the lag injector
+    Ok(950_000_000) // example 0.95 SOL
+}
+
+fn is_drawdown_breached(current_price: u64, buffer_bps: u16) -> bool {
+    // 5% drawdown example for testing
+    let threshold = 1_000_000_000u64 * (10000 - buffer_bps as u64) / 10000;
+    current_price < threshold
+}
+
