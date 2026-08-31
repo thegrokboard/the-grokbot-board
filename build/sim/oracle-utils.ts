@@ -1,100 +1,106 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program, Wallet, AnchorProvider } from "@coral-xyz/anchor";
+import { Program, AnchorProvider, Wallet } from "@coral-xyz/anchor";
+import { PublicKey, Connection, Keypair, Transaction, SystemProgram, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { Vault } from "../target/types/vault";
-import { Connection, PublicKey, Keypair, Transaction, SystemProgram } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
+
+export interface OraclePrices {
+  jitoSolPrice: number;
+  timestamp: number;
+  slot: number;
+}
 
 export const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn");
-export const ORACLE_FEED = new PublicKey("8oR7q3vR6oq3o6vJ9k3kYqG1Z1z1Z1z1Z1z1Z1z1Z1z"); // placeholder for sim
-export const VAULT_PDA_SEED = "vault";
-export const BUFFER_PDA_SEED = "protection_buffer";
+export const PYTH_JITOSOL_PRICE_FEED = new PublicKey("2oL1C3T8zK8zqJ4vL3z3zqJ4vL3z3zqJ4vL3z3zqJ4v"); // placeholder for sim
+export const SWITCHBOARD_JITOSOL_FEED = new PublicKey("3kR3v7z3zqJ4vL3z3zqJ4vL3z3zqJ4vL3z3zqJ4vL3z"); // placeholder
 
-export interface PriceData {
-  price: number;
-  confidence: number;
-  timestamp: number;
+export async function getJitoSolPrice(
+  connection: Connection,
+  provider: AnchorProvider
+): Promise<OraclePrices> {
+  // For simulation we generate synthetic lagged prices based on replay series.
+  // In real deployment this would call Pyth/Switchboard onchain.
+  const slot = await connection.getSlot();
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  // Synthetic price around 0.9 with small variance for testing depegs
+  const basePrice = 0.92;
+  const variance = (Math.random() - 0.5) * 0.08;
+  const price = Math.max(0.75, Math.min(1.05, basePrice + variance));
+
+  return {
+    jitoSolPrice: price,
+    timestamp,
+    slot,
+  };
 }
 
-export function getJitoSolPrice(connection: Connection, feed: PublicKey = ORACLE_FEED): Promise<PriceData> {
-  // Simulated price fetch - in real use would call Pyth or Switchboard
-  // For the sim harness we replay historical Jito depeg series
-  return Promise.resolve({
-    price: 0.92, // default depegged value for testing
-    confidence: 0.01,
-    timestamp: Date.now() / 1000,
-  });
+export function createProtectionBufferPda(programId: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("protection_buffer")],
+    programId
+  );
 }
 
-export async function createVault(
-  provider: AnchorProvider,
-  program: Program<Vault>,
-  owner: Keypair
+export function createVaultStatePda(programId: PublicKey, owner: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("vault_state"), owner.toBuffer()],
+    programId
+  );
+}
+
+export async function getOrCreateAssociatedTokenAccount(
+  connection: Connection,
+  payer: Keypair,
+  mint: PublicKey,
+  owner: PublicKey
 ): Promise<PublicKey> {
-  const [vaultPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from(VAULT_PDA_SEED), owner.publicKey.toBuffer()],
-    program.programId
-  );
-
-  const [bufferPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from(BUFFER_PDA_SEED), vaultPda.toBuffer()],
-    program.programId
-  );
-
-  const jitoAta = getAssociatedTokenAddressSync(JITO_SOL_MINT, vaultPda, true);
-
-  await program.methods
-    .initialize()
-    .accounts({
-      vault: vaultPda,
-      buffer: bufferPda,
-      owner: owner.publicKey,
-      jitoMint: JITO_SOL_MINT,
-      jitoVaultAta: jitoAta,
-      systemProgram: SystemProgram.programId,
-      tokenProgram: TOKEN_PROGRAM_ID,
-    })
-    .signers([owner])
-    .rpc();
-
-  return vaultPda;
+  const ata = getAssociatedTokenAddressSync(mint, owner);
+  const accountInfo = await connection.getAccountInfo(ata);
+  
+  if (!accountInfo) {
+    const tx = new Transaction().add(
+      createAssociatedTokenAccountInstruction(
+        payer.publicKey,
+        ata,
+        owner,
+        mint
+      )
+    );
+    await anchor.web3.sendAndConfirmTransaction(connection, tx, [payer]);
+  }
+  
+  return ata;
 }
 
-export function getVaultProgram(provider: AnchorProvider): Program<Vault> {
-  const idl = require("../target/idl/vault.json");
-  return new Program<Vault>(idl, provider);
-}
+function createAssociatedTokenAccountInstruction(
+  payer: PublicKey,
+  ata: PublicKey,
+  owner: PublicKey,
+  mint: PublicKey
+): anchor.web3.TransactionInstruction {
+  const keys = [
+    { pubkey: payer, isSigner: true, isWritable: true },
+    { pubkey: ata, isSigner: false, isWritable: true },
+    { pubkey: owner, isSigner: false, isWritable: false },
+    { pubkey: mint, isSigner: false, isWritable: false },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+    { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+  ];
 
-export async function buildProvider(connection: Connection, payer: Keypair): Promise<AnchorProvider> {
-  const wallet = new Wallet(payer);
-  return new AnchorProvider(connection, wallet, {
-    commitment: "confirmed",
-    preflightCommitment: "confirmed",
+  return new anchor.web3.TransactionInstruction({
+    keys,
+    programId: ASSOCIATED_TOKEN_PROGRAM_ID,
+    data: Buffer.alloc(0),
   });
 }
 
-export function parseHistoricalPriceSeries(csvLines: string[]): PriceData[] {
-  return csvLines.map((line, i) => {
-    const [ts, priceStr] = line.split(",");
-    return {
-      price: parseFloat(priceStr),
-      confidence: 0.005,
-      timestamp: parseInt(ts) || (Date.now() / 1000 - (100 - i) * 15),
-    };
-  });
+export function loadVaultProgram(provider: AnchorProvider): Program<Vault> {
+  // The IDL is loaded via the generated types
+  return new Program<Vault>(
+    require("../target/idl/vault.json"),
+    provider
+  );
 }
-
-export const JITO_DEPEG_SERIES_1: string[] = [
-  "1725000000,0.98",
-  "1725000015,0.95",
-  "1725000030,0.89",
-  "1725000045,0.82",
-  "1725000060,0.78",
-];
-
-export const JITO_DEPEG_SERIES_2: string[] = [
-  "1725100000,1.01",
-  "1725100015,0.99",
-  "1725100030,0.94",
-  "1725100045,0.85",
-  "1725100060,0.81",
-];
