@@ -39,16 +39,21 @@ pub mod vault {
     }
 
     pub fn drawdown_circuit_breaker(ctx: Context<DrawdownCircuitBreaker>) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
         let clock = Clock::get()?;
         let price = ctx.accounts.oracle.get_price()?;
 
-        let twap = calculate_twap(vault.last_twap, vault.last_update_slot, price, clock.slot)?;
+        let twap = calculate_twap(
+            ctx.accounts.vault.last_twap,
+            ctx.accounts.vault.last_update_slot,
+            price,
+            clock.slot,
+        )?;
 
         require!(twap < 9500, ErrorCode::NoDrawdownDetected); // 5% drawdown threshold example
 
         // Protection buffer withdrawal (owner only in prod; simplified for sim)
-        let buffer_amount = calculate_buffer_amount(vault.total_deposited, vault.buffer_bps);
+        let buffer_amount =
+            calculate_buffer_amount(ctx.accounts.vault.total_deposited, ctx.accounts.vault.buffer_bps);
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -62,6 +67,7 @@ pub mod vault {
             buffer_amount,
         )?;
 
+        let vault = &mut ctx.accounts.vault;
         vault.total_deposited = vault.total_deposited.checked_sub(buffer_amount).unwrap();
         vault.last_twap = twap;
         vault.last_update_slot = clock.slot;
@@ -84,9 +90,14 @@ pub mod vault {
     }
 
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.owner.key() == vault.owner, ErrorCode::Unauthorized);
-        require!(amount <= vault.total_deposited, ErrorCode::InsufficientFunds);
+        require!(
+            ctx.accounts.owner.key() == ctx.accounts.vault.owner,
+            ErrorCode::Unauthorized
+        );
+        require!(
+            amount <= ctx.accounts.vault.total_deposited,
+            ErrorCode::InsufficientFunds
+        );
 
         token::transfer(
             CpiContext::new_with_signer(
@@ -101,6 +112,7 @@ pub mod vault {
             amount,
         )?;
 
+        let vault = &mut ctx.accounts.vault;
         vault.total_deposited = vault.total_deposited.checked_sub(amount).unwrap();
         Ok(())
     }
