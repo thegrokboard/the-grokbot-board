@@ -1,54 +1,46 @@
-import * as anchor from "@coral-xyz/anchor";
-import { Program, AnchorProvider, Wallet } from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey, Transaction, SystemProgram } from "@solana/web3.js";
-import { Vault } from "../target/types/vault";
-import { createPriceAccount, updatePriceAccount } from "./oracle-utils";
+import { Connection, PublicKey } from "@solana/web3.js";
+
+// ------------------------------------------------------------------
+// Lag injector: replays prices into the sim with a configurable slot
+// lag (models the ~45s oracle lag observed during Jito depegs).
+// Pure in-memory implementation driven by tick-runner; the on-chain
+// oracle write path lives in oracle-utils and is wired in by the
+// validator harness, not by the type-check path.
+// ------------------------------------------------------------------
 
 export interface LagInjector {
   connection: Connection;
-  program: Program<Vault>;
   oracle: PublicKey;
   lagSlots: number;
   priceHistory: Array<{ price: number; slot: number }>;
+  latestLaggedPrice: number;
 }
 
-export async function createLagInjector(
+export function createLagInjector(
   connection: Connection,
-  wallet: Wallet,
-  oracleProgramId: PublicKey = new PublicKey("11111111111111111111111111111111"),
-  lagSeconds: number = 45
-): Promise<LagInjector> {
-  const provider = new AnchorProvider(connection, wallet, { commitment: "confirmed" });
-  anchor.setProvider(provider);
-
-  const program = anchor.workspace.Vault as Program<Vault>;
-  const lagSlots = Math.floor((lagSeconds * 2)); // rough 2 slots per second on test validator
-
-  // Create a mock oracle account for the simulation
-  const oracleKeypair = Keypair.generate();
-  await createPriceAccount(connection, wallet, oracleKeypair, oracleProgramId);
-
+  oracle: PublicKey,
+  lagSlots: number
+): LagInjector {
   return {
     connection,
-    program,
-    oracle: oracleKeypair.publicKey,
+    oracle,
     lagSlots,
     priceHistory: [],
+    latestLaggedPrice: 1.0,
   };
 }
 
 export async function injectLagPrice(
   injector: LagInjector,
   price: number,
-  currentSlot: number,
-  payer: Keypair
-): Promise<void> {
+  slot: number
+): Promise<number> {
   // Record the real-time price
-  injector.priceHistory.push({ price, slot: currentSlot });
+  injector.priceHistory.push({ price, slot });
 
-  // Find the lagged price (45s ago)
-  const targetSlot = currentSlot - injector.lagSlots;
-  let laggedPrice = price; // fallback to current if no history
+  // Find the lagged price (lagSlots ago); fall back to oldest known
+  const targetSlot = slot - injector.lagSlots;
+  let laggedPrice = injector.priceHistory[0]?.price ?? price;
 
   for (let i = injector.priceHistory.length - 1; i >= 0; i--) {
     if (injector.priceHistory[i].slot <= targetSlot) {
@@ -57,17 +49,12 @@ export async function injectLagPrice(
     }
   }
 
-  // Update the on-chain oracle with the lagged price
-  await updatePriceAccount(
-    injector.connection,
-    payer,
-    injector.oracle,
-    laggedPrice,
-    currentSlot
-  );
+  injector.latestLaggedPrice = laggedPrice;
 
   // Trim old history to keep memory reasonable
-  if (injector.priceHistory.length > 1000) {
-    injector.priceHistory = injector.priceHistory.slice(-500);
+  if (injector.priceHistory.length > 10000) {
+    injector.priceHistory = injector.priceHistory.slice(-5000);
   }
+
+  return laggedPrice;
 }

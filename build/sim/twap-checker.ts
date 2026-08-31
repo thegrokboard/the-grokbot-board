@@ -114,6 +114,31 @@ export class TwapChecker {
   }
 }
 
+// ------------------------------------------------------------------
+// Lightweight in-memory 15s TWAP false-positive check used by the
+// tick-runner sim loop. Given the recent price history and a drawdown
+// threshold, returns true when the latest print deviates from the
+// short TWAP by more than the threshold while the TWAP itself is
+// still healthy (a lag artifact, not a real depeg).
+// ------------------------------------------------------------------
+export function checkTWAPFalsePositive(
+  priceHistory: number[],
+  threshold: number
+): boolean {
+  if (priceHistory.length < 3) return false;
+
+  // TWAP over the last window (up to 30 samples ~ 15s of ticks)
+  const window = priceHistory.slice(-30);
+  const twap = window.reduce((s, p) => s + p, 0) / window.length;
+  const latest = priceHistory[priceHistory.length - 1];
+
+  const deviation = (twap - latest) / twap;
+
+  // Transient spike: latest print breaches the threshold vs TWAP,
+  // but the TWAP itself has not depegged. Treat as false positive.
+  return deviation > threshold && twap > 0.97;
+}
+
 // Export a helper to run against the last three Jito depeg series (placeholder data for CI)
 export async function runFalsePositiveCheck(
   connection: Connection,
