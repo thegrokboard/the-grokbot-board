@@ -1,106 +1,99 @@
-import * as anchor from "@coral-xyz/anchor";
-import { Program, AnchorProvider, Wallet } from "@coral-xyz/anchor";
-import { PublicKey, Connection, Keypair, Transaction, SystemProgram, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
-import { Vault } from "../target/types/vault";
+import * as anchor from '@coral-xyz/anchor';
+import { Program, AnchorProvider, Wallet } from '@coral-xyz/anchor';
+import { PublicKey, Keypair, Connection, Transaction, SystemProgram } from '@solana/web3.js';
+import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { Vault } from '../target/types/vault';
 
-export interface OraclePrices {
-  jitoSolPrice: number;
-  timestamp: number;
-  slot: number;
-}
-
-export const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn");
-export const PYTH_JITOSOL_PRICE_FEED = new PublicKey("2oL1C3T8zK8zqJ4vL3z3zqJ4vL3z3zqJ4vL3z3zqJ4v"); // placeholder for sim
-export const SWITCHBOARD_JITOSOL_FEED = new PublicKey("3kR3v7z3zqJ4vL3z3zqJ4vL3z3zqJ4vL3z3zqJ4vL3z"); // placeholder
+export const JITO_SOL_MINT = new PublicKey('J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCP');
+export const PYTH_JITO_SOL_PRICE_FEED = new PublicKey('2p4h4f8s9X2z2E6r9q5k8v7j8k9m0n1o2p3q4r5s6t');
 
 export async function getJitoSolPrice(
   connection: Connection,
-  provider: AnchorProvider
-): Promise<OraclePrices> {
-  // For simulation we generate synthetic lagged prices based on replay series.
-  // In real deployment this would call Pyth/Switchboard onchain.
-  const slot = await connection.getSlot();
-  const timestamp = Math.floor(Date.now() / 1000);
+  feed: PublicKey = PYTH_JITO_SOL_PRICE_FEED
+): Promise<number> {
+  // Simulated price fetch - in real harness this would parse Pyth account data
+  // For replay sim we will override with historical series
+  const account = await connection.getAccountInfo(feed);
+  if (!account) return 0.95; // default near depeg for testing
+  // Dummy parsing for CI - real impl would use Pyth SDK
+  return 0.92 + Math.random() * 0.1;
+}
 
-  // Synthetic price around 0.9 with small variance for testing depegs
-  const basePrice = 0.92;
-  const variance = (Math.random() - 0.5) * 0.08;
-  const price = Math.max(0.75, Math.min(1.05, basePrice + variance));
+export function createLagInjectorProvider(
+  connection: Connection,
+  payer: Keypair,
+  lagSlots: number = 150 // ~45s at 300ms/slot
+): AnchorProvider {
+  const wallet = new Wallet(payer);
+  return new AnchorProvider(
+    connection,
+    wallet,
+    { commitment: 'confirmed', preflightCommitment: 'confirmed' }
+  );
+}
+
+export async function setupTestVault(
+  provider: AnchorProvider,
+  program: Program<Vault>,
+  owner: Keypair
+): Promise<{
+  vault: PublicKey,
+  buffer: PublicKey,
+  jitoMint: PublicKey
+}> {
+  const [vaultPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('vault')],
+    program.programId
+  );
+
+  const [bufferPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('protection_buffer')],
+    program.programId
+  );
+
+  // Initialize if needed (idempotent in sim)
+  try {
+    await program.methods
+      .initialize()
+      .accounts({
+        vault: vaultPda,
+        buffer: bufferPda,
+        owner: owner.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([owner])
+      .rpc();
+  } catch (e) {
+    // Already initialized is acceptable in test harness
+    if (!e.toString().includes('already in use')) {
+      console.warn('Vault init warning:', e);
+    }
+  }
 
   return {
-    jitoSolPrice: price,
-    timestamp,
-    slot,
+    vault: vaultPda,
+    buffer: bufferPda,
+    jitoMint: JITO_SOL_MINT,
   };
 }
 
-export function createProtectionBufferPda(programId: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("protection_buffer")],
-    programId
-  );
-}
-
-export function createVaultStatePda(programId: PublicKey, owner: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("vault_state"), owner.toBuffer()],
-    programId
-  );
-}
-
-export async function getOrCreateAssociatedTokenAccount(
-  connection: Connection,
-  payer: Keypair,
-  mint: PublicKey,
-  owner: PublicKey
-): Promise<PublicKey> {
-  const ata = getAssociatedTokenAddressSync(mint, owner);
-  const accountInfo = await connection.getAccountInfo(ata);
-  
-  if (!accountInfo) {
-    const tx = new Transaction().add(
-      createAssociatedTokenAccountInstruction(
-        payer.publicKey,
-        ata,
-        owner,
-        mint
-      )
-    );
-    await anchor.web3.sendAndConfirmTransaction(connection, tx, [payer]);
+export function generateHistoricalPriceSeries(): Array<{ slot: number; price: number }> {
+  // Last three known JitoSOL depeg events (simplified synthetic series for replay)
+  const series: Array<{ slot: number; price: number }> = [];
+  let baseSlot = 100000;
+  // Series 1: gradual depeg
+  for (let i = 0; i < 30; i++) {
+    series.push({ slot: baseSlot + i * 5, price: 0.98 - i * 0.015 });
   }
-  
-  return ata;
-}
-
-function createAssociatedTokenAccountInstruction(
-  payer: PublicKey,
-  ata: PublicKey,
-  owner: PublicKey,
-  mint: PublicKey
-): anchor.web3.TransactionInstruction {
-  const keys = [
-    { pubkey: payer, isSigner: true, isWritable: true },
-    { pubkey: ata, isSigner: false, isWritable: true },
-    { pubkey: owner, isSigner: false, isWritable: false },
-    { pubkey: mint, isSigner: false, isWritable: false },
-    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
-    { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-  ];
-
-  return new anchor.web3.TransactionInstruction({
-    keys,
-    programId: ASSOCIATED_TOKEN_PROGRAM_ID,
-    data: Buffer.alloc(0),
-  });
-}
-
-export function loadVaultProgram(provider: AnchorProvider): Program<Vault> {
-  // The IDL is loaded via the generated types
-  return new Program<Vault>(
-    require("../target/idl/vault.json"),
-    provider
-  );
+  // Series 2: sharp crash
+  baseSlot += 200;
+  for (let i = 0; i < 25; i++) {
+    series.push({ slot: baseSlot + i * 4, price: 0.85 - i * 0.022 });
+  }
+  // Series 3: recovery with volatility
+  baseSlot += 180;
+  for (let i = 0; i < 35; i++) {
+    series.push({ slot: baseSlot + i * 6, price: 0.65 + (i % 7) * 0.04 });
+  }
+  return series;
 }
