@@ -1,123 +1,70 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::sysvar::{self, Sysvar};
 use bytemuck::{Pod, Zeroable};
+use std::mem;
 
-declare_id!("Vault1111111111111111111111111111111111111111");
+declare_id!("Vau1t9z2z7z7z7z7z7z7z7z7z7z7z7z7z7z7z7z7");
 
 #[program]
 pub mod vault {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, owner: Pubkey, buffer_bps: u16) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>, buffer_bump: u8) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        vault.owner = owner;
-        vault.buffer_bps = buffer_bps;
-        vault.paused = false;
-        vault.last_twap = 0;
-        vault.last_update_slot = 0;
+        vault.owner = *ctx.accounts.owner.key;
+        vault.buffer_bump = buffer_bump;
+        vault.is_paused = false;
+        vault.protection_buffer = 0;
         Ok(())
     }
 
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(!vault.paused, ErrorCode::VaultPaused);
-
-        // In sim we just record; real would CPI to jito stake pool
-        let clock = Clock::get()?;
-        vault.last_update_slot = clock.slot;
-
-        Ok(())
-    }
-
-    pub fn update_price(ctx: Context<UpdatePrice>) -> Result<()> {
-        let price_account = &ctx.accounts.price_account;
-        let vault = &mut ctx.accounts.vault;
-        let clock = Clock::get()?;
-
-        let price = price_account.get_price();
-        let slot = price_account.get_slot();
-
-        // Simple TWAP simulation for 15s window (assume ~0.4s/slot, ~38 slots)
-        let window_slots = 40u64;
-        if slot > window_slots && vault.last_update_slot > 0 {
-            let twap = price; // placeholder: real impl would use oracle history or buffer
-            vault.last_twap = twap;
-        } else {
-            vault.last_twap = price;
-        }
-        vault.last_update_slot = slot;
-
-        Ok(())
-    }
-
-    pub fn check_drawdown(ctx: Context<CheckDrawdown>) -> Result<()> {
-        let vault = &ctx.accounts.vault;
-        let price_account = &ctx.accounts.price_account;
-        require!(!vault.paused, ErrorCode::VaultPaused);
-
-        let current_price = price_account.get_price();
-        let twap = vault.last_twap;
-
-        if twap == 0 {
-            return Ok(());
-        }
-
-        let drawdown_bps = if current_price < twap {
-            ((twap - current_price) * 10000 / twap) as u16
-        } else {
-            0
-        };
-
-        let threshold = vault.buffer_bps;
-        if drawdown_bps > threshold {
-            // Trigger circuit breaker: pause vault
-            let vault_mut = &mut ctx.accounts.vault;
-            vault_mut.paused = true;
-            msg!("Circuit breaker tripped! Drawdown {} bps > buffer {} bps", drawdown_bps, threshold);
-        }
-
+        require!(!vault.is_paused, VaultError::VaultPaused);
+        // In sim, jitoSOL deposit is mocked via token transfer; here we just update buffer
+        vault.protection_buffer = vault.protection_buffer.saturating_add(amount);
         Ok(())
     }
 
     pub fn pause(ctx: Context<Pause>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.authority.key() == vault.owner, ErrorCode::Unauthorized);
-        vault.paused = true;
+        require!(ctx.accounts.owner.key() == vault.owner, VaultError::Unauthorized);
+        vault.is_paused = true;
         Ok(())
     }
 
-    pub fn unpause(ctx: Context<Unpause>) -> Result<()> {
+    pub fn withdraw_buffer(ctx: Context<WithdrawBuffer>, amount: u64) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.authority.key() == vault.owner, ErrorCode::Unauthorized);
-        vault.paused = false;
+        require!(ctx.accounts.owner.key() == vault.owner, VaultError::Unauthorized);
+        require!(amount <= vault.protection_buffer, VaultError::InsufficientBuffer);
+        vault.protection_buffer = vault.protection_buffer.saturating_sub(amount);
+        // Token transfer to owner would happen in real impl; omitted for sim
         Ok(())
     }
 
-    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-        let vault = &ctx.accounts.vault;
-        require!(ctx.accounts.authority.key() == vault.owner, ErrorCode::Unauthorized);
-        // Real impl would transfer from buffer/vault; sim just logs
-        msg!("Owner withdrew {} lamports", amount);
+    pub fn check_drawdown(ctx: Context<CheckDrawdown>) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        let oracle = &ctx.accounts.oracle;
+        require!(!vault.is_paused, VaultError::VaultPaused);
+
+        let current_price = oracle.get_price();
+        let current_slot = oracle.get_slot();
+
+        // 15s TWAP logic is driven from TS side; here we enforce a simple drawdown circuit breaker
+        // If price < 0.85 * last_known (simplified; real would use stored TWAP), trip breaker
+        if current_price < 850_000_000u64 {  // assumes 1e9 scale for ~0.85
+            vault.is_paused = true;
+            msg!("Drawdown circuit breaker tripped at price {}", current_price);
+        }
         Ok(())
     }
-}
-
-#[account]
-#[derive(Default)]
-pub struct Vault {
-    pub owner: Pubkey,
-    pub buffer_bps: u16,       // e.g. 500 = 5%
-    pub paused: bool,
-    pub last_twap: u64,        // scaled price
-    pub last_update_slot: u64,
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = signer, space = 8 + 32 + 2 + 1 + 8 + 8)]
+    #[account(init, payer = owner, space = 8 + 64, seeds = [b"vault"], bump)]
     pub vault: Account<'info, Vault>,
     #[account(mut)]
-    pub signer: Signer<'info>,
+    pub owner: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -125,15 +72,21 @@ pub struct Initialize<'info> {
 pub struct Deposit<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
-    pub signer: Signer<'info>,
+    pub owner: Signer<'info>,
 }
 
 #[derive(Accounts)]
-pub struct UpdatePrice<'info> {
+pub struct Pause<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
-    #[account()]
-    pub price_account: Account<'info, PriceAccount>,
+    pub owner: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawBuffer<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    pub owner: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -141,37 +94,25 @@ pub struct CheckDrawdown<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     #[account()]
-    pub price_account: Account<'info, PriceAccount>,
+    pub oracle: Account<'info, PriceAccount>,
+    pub owner: Signer<'info>,
 }
 
-#[derive(Accounts)]
-pub struct Pause<'info> {
-    #[account(mut)]
-    pub vault: Account<'info, Vault>,
-    pub authority: Signer<'info>,
+#[account]
+pub struct Vault {
+    pub owner: Pubkey,
+    pub is_paused: bool,
+    pub protection_buffer: u64,
+    pub buffer_bump: u8,
 }
 
-#[derive(Accounts)]
-pub struct Unpause<'info> {
-    #[account(mut)]
-    pub vault: Account<'info, Vault>,
-    pub authority: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct Withdraw<'info> {
-    #[account(mut)]
-    pub vault: Account<'info, Vault>,
-    pub authority: Signer<'info>,
-}
-
-#[account(zero_copy)]
-#[derive(Copy, Clone, Pod, Zeroable)]
+#[derive(Clone, Copy)]
 #[repr(C)]
+#[derive(Pod, Zeroable)]
 pub struct PriceAccount {
+    pub price: u64,      // scaled price (e.g. 1e9 = $1)
     pub slot: u64,
-    pub price: u64,        // e.g. scaled by 1e9 for JitoSOL ~1.0
-    pub _padding: [u8; 32],
+    pub _padding: [u8; 16],
 }
 
 impl PriceAccount {
@@ -184,10 +125,40 @@ impl PriceAccount {
     }
 }
 
+// Manual impls to avoid conflicts with Pod/Zeroable and Anchor serialization
+impl anchor_lang::AccountSerialize for PriceAccount {
+    fn try_serialize<W: std::io::Write>(&self, writer: &mut W) -> anchor_lang::Result<()> {
+        let bytes = unsafe { mem::transmute::<&PriceAccount, &[u8; mem::size_of::<PriceAccount>()]>(self) };
+        writer.write_all(bytes).map_err(|_| anchor_lang::error::ErrorCode::AccountDidNotSerialize)?;
+        Ok(())
+    }
+}
+
+impl anchor_lang::AccountDeserialize for PriceAccount {
+    fn try_deserialize(buf: &mut &[u8]) -> anchor_lang::Result<Self> {
+        if buf.len() < mem::size_of::<PriceAccount>() {
+            return Err(anchor_lang::error::ErrorCode::AccountDidNotDeserialize.into());
+        }
+        let price_account: PriceAccount = unsafe { *(buf.as_ptr() as *const PriceAccount) };
+        *buf = &buf[mem::size_of::<PriceAccount>()..];
+        Ok(price_account)
+    }
+
+    fn try_deserialize_unchecked(buf: &mut &[u8]) -> anchor_lang::Result<Self> {
+        Self::try_deserialize(buf)
+    }
+}
+
+impl anchor_lang::Discriminator for PriceAccount {
+    const DISCRIMINATOR: [u8; 8] = [0; 8];  // No discriminator for raw oracle-like account
+}
+
 #[error_code]
-pub enum ErrorCode {
+pub enum VaultError {
     #[msg("Vault is paused")]
     VaultPaused,
-    #[msg("Unauthorized")]
+    #[msg("Unauthorized owner")]
     Unauthorized,
+    #[msg("Insufficient protection buffer")]
+    InsufficientBuffer,
 }
