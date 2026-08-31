@@ -1,11 +1,12 @@
 [package]
 name = "vault"
 version = "0.1.0"
-description = "Onchain JitoSOL depeg protection vault with drawdown circuit-breaker"
+description = "JitoSOL depeg protection vault with drawdown circuit breaker"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "lib"]
+name = "vault"
 
 [features]
 no-entrypoint = []
@@ -15,10 +16,19 @@ cpi = ["no-entrypoint"]
 default = []
 
 [dependencies]
-anchor-lang = "0.29.0"
-anchor-spl = "0.29.0"
+anchor-lang = { version = "0.29.0", features = ["init-if-needed"] }
+bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
+bytemuck_derive = "1.5"
 solana-program = "1.18"
+jito-stake-pool = { version = "0.1", optional = true }
 
 [dev-dependencies]
-anchor-client = "0.29.0"
+solana-program-test = "1.18"
 solana-sdk = "1.18"
+
+[profile.release]
+overflow-checks = true
+codegen-units = 1
+[profile.release.build-override]
+opt-level = 3
+incremental = false
