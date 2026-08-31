@@ -19,17 +19,19 @@ export async function createLagInjector(
   const wallet = provider.wallet as Wallet;
 
   // Load the historical Jito depeg price series (timestamp, price)
-  const priceSeries = await loadJitoDepegSeries();
+  const priceSeries = loadJitoDepegSeries();
+  // Flatten all series into a single tick stream for injection
+  const allTicks = priceSeries.flatMap((s) => s.ticks);
 
   let currentIndex = 0;
   let lastSlot = 0;
 
   const injectLagPrice = async (lagSlots: number = 180): Promise<void> => {
-    if (currentIndex >= priceSeries.length) {
+    if (currentIndex >= allTicks.length) {
       currentIndex = 0; // loop for repeated sim runs
     }
 
-    const entry = priceSeries[currentIndex];
+    const entry = allTicks[currentIndex];
     const now = Math.floor(Date.now() / 1000);
     const laggedTimestamp = now - (lagSlots * 0.4); // ~400ms per slot approx
 
