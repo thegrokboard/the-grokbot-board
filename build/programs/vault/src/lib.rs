@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount};
 
-declare_id!("Vau1tX1xJq9fZ5vK8mL9pQ2wE3rT4yU5iV6oW7xY8zA9");
+declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
 #[program]
 pub mod vault {
@@ -82,7 +82,7 @@ pub struct Initialize<'info> {
         init,
         payer = payer,
         seeds = [b"buffer"],
-        bump = buffer_bump,
+        bump,
         space = 8 + 32
     )]
     pub buffer: Account<'info, Buffer>,
