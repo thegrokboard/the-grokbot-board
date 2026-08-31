@@ -2,7 +2,7 @@ import * as anchor from "@coral-xyz/anchor";
 import { Program, AnchorProvider } from "@coral-xyz/anchor";
 import { Vault } from "../target/types/vault";
 import { Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
-import { OraclePrices, getJitoSOLPrice } from "./oracle-utils"; // helper for replay series
+import { getJitoSolPrice } from "./oracle-utils"; // helper for replay series
 
 // Hard-coded replay of last three historical Jito depeg series (price in lamports per SOL, slot timestamps)
 const REPLAY_SERIES = [
@@ -96,7 +96,7 @@ export async function runLagInjection(): Promise<void> {
 
   // Test keys - match typical Anchor test setup
   const oracleKeypair = Keypair.generate();
-  const owner = provider.wallet.payer as Keypair; // usually the test payer
+  const owner = (provider.wallet as anchor.Wallet & { payer: Keypair }).payer; // usually the test payer
 
   // Create oracle account (simplified)
   await provider.connection.confirmTransaction(
