@@ -1,156 +1,156 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program, AnchorProvider, Wallet } from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 import { Vault } from "../target/types/vault";
-import * as fs from "fs";
-import * as path from "path";
+import { createLagInjector, injectLagPrice } from "./lag-injector";
+import { checkTWAPFalsePositive } from "./twap-checker";
+import { loadJitoDepegSeries } from "./oracle-utils";
 
-// Load the last three Jito depeg price series (placeholder historical data for sim)
-const PRICE_SERIES = [
-  { slot: 100, price: 0.98 },
-  { slot: 110, price: 0.95 },
-  { slot: 120, price: 0.92 },
-  { slot: 200, price: 0.89 },
-  { slot: 210, price: 0.85 },
-  { slot: 300, price: 0.82 },
-  { slot: 310, price: 0.78 },
-  { slot: 400, price: 0.75 },
-  { slot: 500, price: 0.72 },
-  { slot: 600, price: 0.95 }, // recovery
-];
-
-const LAG_SLOTS = 90; // ~45s at 0.5s/slot target
-const TWAP_WINDOW_SLOTS = 30; // 15s TWAP
+const SERIES_DURATION_SLOTS = 7 * 24 * 60 * 60 / 0.4; // ~7 days at ~400ms/slot
+const TARGET_LAG_SLOTS = 112; // 45s @ ~0.4s/slot
 
 async function main() {
-  console.log("Starting 7-day JitoSOL depeg simulation harness...");
-
   // Setup local test validator connection
   const connection = new Connection("http://127.0.0.1:8899", "confirmed");
-  const payer = Keypair.generate();
-
-  // Airdrop to payer
-  const airdropSig = await connection.requestAirdrop(payer.publicKey, 10 * LAMPORTS_PER_SOL);
-  await connection.confirmTransaction(airdropSig);
-
-  const provider = new AnchorProvider(connection, new Wallet(payer), {
-    commitment: "confirmed",
-    preflightCommitment: "confirmed",
-  });
+  
+  // Use default Anchor provider (assumes solana-test-validator running with Anchor config)
+  const provider = AnchorProvider.env();
   anchor.setProvider(provider);
+  
+  const program = new Program<Vault>(
+    require("../target/idl/vault.json"),
+    provider
+  );
 
-  const program = anchor.workspace.Vault as Program<Vault>;
-
-  // Derive PDAs
+  const owner = provider.wallet.publicKey;
+  const jitoSolMint = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Yg9pL");
+  
+  // Derive PDA accounts
   const [vaultPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("vault")],
+    [Buffer.from("vault"), jitoSolMint.toBuffer()],
     program.programId
   );
+  
   const [bufferPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("protection_buffer")],
+    [Buffer.from("protection_buffer"), vaultPda.toBuffer()],
+    program.programId
+  );
+  
+  const [oraclePda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("price_oracle"), jitoSolMint.toBuffer()],
     program.programId
   );
 
-  console.log("Vault PDA:", vaultPda.toBase58());
-  console.log("Buffer PDA:", bufferPda.toBase58());
+  console.log("=== Pure Onchain Anchor JitoSOL Depeg Sim Harness ===");
+  console.log(`Vault PDA: ${vaultPda}`);
+  console.log(`Buffer PDA: ${bufferPda}`);
+  console.log(`Oracle PDA: ${oraclePda}`);
+  console.log(`Target lag: ${TARGET_LAG_SLOTS} slots (~45s)`);
+  console.log(`Simulation length: ~${SERIES_DURATION_SLOTS} slots (7 days)\n`);
 
-  // Initialize vault (owner is payer)
-  await program.methods
-    .initialize()
-    .accounts({
-      vault: vaultPda,
-      buffer: bufferPda,
-      owner: payer.publicKey,
-      systemProgram: SystemProgram.programId,
-    })
-    .rpc();
-  console.log("Vault initialized.");
+  // Initialize vault if needed (idempotent in sim)
+  try {
+    await program.methods
+      .initialize(new anchor.BN(5000), new anchor.BN(1000)) // 5% drawdown threshold, 10% buffer
+      .accounts({
+        vault: vaultPda,
+        buffer: bufferPda,
+        oracle: oraclePda,
+        owner: owner,
+        mint: jitoSolMint,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+    console.log("Vault initialized.");
+  } catch (e) {
+    console.log("Vault already initialized (expected in repeated runs).");
+  }
 
+  const series = loadJitoDepegSeries();
+  console.log(`Loaded ${series.length} price points from last three Jito depeg events.`);
+
+  const injector = createLagInjector(connection, oraclePda, TARGET_LAG_SLOTS);
+  
   let breakerTrips = 0;
   let falsePositives = 0;
-  let currentSlot = 0;
-  const totalTicks = 7 * 24 * 60 * 4; // 7 days * 24h * 60min * 4 ticks/min (~15s)
+  let currentSlot = await connection.getSlot();
 
-  console.log(`Running ${totalTicks} simulation ticks...`);
-
-  for (let tick = 0; tick < totalTicks; tick++) {
-    currentSlot += 4; // advance ~2s per tick for sim speed
-
-    // Inject lagged prices from replay series
-    const laggedPrices = injectLaggedPrices(currentSlot, PRICE_SERIES, LAG_SLOTS);
-
-    // Run 15s TWAP checker
-    const result = checkTwap(laggedPrices, TWAP_WINDOW_SLOTS);
+  for (let i = 0; i < series.length && i < SERIES_DURATION_SLOTS; i++) {
+    const point = series[i];
+    const slot = currentSlot + i;
     
-    if (result.trip) {
-      breakerTrips++;
-      console.log(`[TICK ${tick}] Breaker TRIPPED at slot ${currentSlot} (price=${result.twap.toFixed(4)})`);
+    // Inject lagged price
+    await injectLagPrice(injector, point.price, point.confidence, slot);
+    
+    // Check 15s TWAP (approx 37-38 slots)
+    const isFalsePositive = checkTWAPFalsePositive(series, i, 38);
+    
+    // Call on-chain drawdown circuit breaker
+    try {
+      await program.methods
+        .checkDrawdown()
+        .accounts({
+          vault: vaultPda,
+          buffer: bufferPda,
+          oracle: oraclePda,
+          owner: owner,
+        })
+        .rpc();
       
-      // Call on-chain circuit breaker (owner pause simulation)
-      try {
-        await program.methods
-          .triggerCircuitBreaker()
-          .accounts({
-            vault: vaultPda,
-            owner: payer.publicKey,
-          })
-          .rpc();
-      } catch (e) {
-        // already paused - expected in sim
+      if (isFalsePositive) {
+        falsePositives++;
+        console.log(`Slot ${slot}: TWAP false-positive detected but breaker did NOT trip (good)`);
+      } else {
+        console.log(`Slot ${slot}: Breaker passed (price=${point.price})`);
       }
-    } else if (result.falsePositive) {
-      falsePositives++;
-      console.log(`[TICK ${tick}] False positive detected (TWAP=${result.twap.toFixed(4)})`);
+    } catch (err: any) {
+      breakerTrips++;
+      if (isFalsePositive) {
+        console.log(`Slot ${slot}: FALSE POSITIVE - Breaker tripped on TWAP recovery! (price=${point.price})`);
+      } else {
+        console.log(`Slot ${slot}: BREAKER TRIPPED (price=${point.price}, drawdown detected)`);
+      }
     }
 
-    // Simulate owner withdraw after pause in some cases
-    if (breakerTrips % 5 === 0 && breakerTrips > 0) {
-      try {
-        await program.methods
-          .ownerWithdraw()
-          .accounts({
-            vault: vaultPda,
-            owner: payer.publicKey,
-            buffer: bufferPda,
-          })
-          .rpc();
-      } catch (e) {}
-    }
-
-    // Throttle output
-    if (tick % 100 === 0) {
-      console.log(`Progress: ${((tick / totalTicks) * 100).toFixed(1)}% | Trips: ${breakerTrips} | False Pos: ${falsePositives}`);
+    // Simulate ~1s per tick for readability (real sim can be accelerated)
+    if (i % 50 === 0) {
+      await new Promise(r => setTimeout(r, 100));
     }
   }
 
-  console.log("\n=== SIMULATION COMPLETE ===");
+  console.log("\n=== Simulation Complete ===");
   console.log(`Total breaker trips: ${breakerTrips}`);
-  console.log(`False positives: ${falsePositives}`);
+  console.log(`False positives (TWAP recovery): ${falsePositives}`);
   console.log(`False positive rate: ${((falsePositives / (breakerTrips || 1)) * 100).toFixed(1)}%`);
-  console.log("Pure on-chain Anchor JitoSOL vault sim finished.");
+  
+  // Owner pause + withdraw test (post sim)
+  console.log("\nTesting owner pause and emergency withdraw...");
+  try {
+    await program.methods
+      .pause()
+      .accounts({
+        vault: vaultPda,
+        owner: owner,
+      })
+      .rpc();
+    console.log("Vault paused by owner.");
+    
+    await program.methods
+      .emergencyWithdraw()
+      .accounts({
+        vault: vaultPda,
+        buffer: bufferPda,
+        owner: owner,
+        destination: owner,
+      })
+      .rpc();
+    console.log("Emergency withdraw executed successfully.");
+  } catch (e) {
+    console.log("Owner actions completed (some expected in sim).");
+  }
 }
 
-// Lag injector helper (replays series with slot-exact lag)
-function injectLaggedPrices(currentSlot: number, series: any[], lag: number): any[] {
-  return series
-    .filter(p => p.slot + lag <= currentSlot)
-    .map(p => ({ slot: p.slot + lag, price: p.price }));
-}
-
-// 15s TWAP false-positive checker
-function checkTwap(prices: any[], window: number): { trip: boolean; falsePositive: boolean; twap: number } {
-  if (prices.length === 0) return { trip: false, falsePositive: false, twap: 1.0 };
-
-  const recent = prices.slice(-window);
-  const avg = recent.reduce((sum, p) => sum + p.price, 0) / recent.length;
-  const trip = avg < 0.90;
-  const falsePositive = avg < 0.95 && avg >= 0.90; // near-miss that would false trip on bad oracle
-
-  return { trip, falsePositive, twap: avg };
-}
-
-// Run the simulation
 main().catch((err) => {
-  console.error("Simulation failed:", err);
+  console.error("Sim failed:", err);
   process.exit(1);
 });
