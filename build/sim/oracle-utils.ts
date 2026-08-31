@@ -1,92 +1,133 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection, Keypair } from "@solana/web3.js";
-import { readFileSync } from "fs";
-import { join } from "path";
+import { PublicKey, Keypair, Connection, SystemProgram } from "@solana/web3.js";
+import { Program } from "@coral-xyz/anchor";
 
-export interface PriceTick {
-  slot: number;
-  price: number; // jitoSOL price in USD (e.g. 0.92)
-  timestamp: number;
+export interface PriceData {
+  price: anchor.BN;
+  confidence: anchor.BN;
+  timestamp: anchor.BN;
+  slot: anchor.BN;
 }
 
-export interface JitoDepegSeries {
-  ticks: PriceTick[];
-  startSlot: number;
-  description: string;
-}
+export const PRICE_ACCOUNT_SIZE = 8 + 32 + 8 + 8 + 8 + 8;
 
-// Path to the replay data (assumed to be committed or generated; for sim we use a minimal synthetic dataset)
-const DATA_PATH = join(__dirname, "jito-depeg-series.json");
+export async function createPriceAccount(
+  connection: Connection,
+  payer: anchor.Wallet,
+  oracleProgramId: PublicKey
+): Promise<PublicKey> {
+  const priceAccount = Keypair.generate();
+  const rent = await connection.getMinimumBalanceForRentExemption(PRICE_ACCOUNT_SIZE);
 
-// Minimal synthetic 3-series dataset for the sim (real data would be loaded from file)
-function getSyntheticSeries(): JitoDepegSeries[] {
-  return [
-    {
-      ticks: [
-        { slot: 100, price: 1.00, timestamp: 1720000000 },
-        { slot: 110, price: 0.98, timestamp: 1720000010 },
-        { slot: 120, price: 0.95, timestamp: 1720000020 },
-        { slot: 130, price: 0.88, timestamp: 1720000030 },
-        { slot: 140, price: 0.85, timestamp: 1720000040 },
-      ],
-      startSlot: 100,
-      description: "Series 1 - mild depeg",
-    },
-    {
-      ticks: [
-        { slot: 200, price: 1.00, timestamp: 1720100000 },
-        { slot: 210, price: 0.97, timestamp: 1720100010 },
-        { slot: 220, price: 0.94, timestamp: 1720100020 },
-        { slot: 230, price: 0.91, timestamp: 1720100030 },
-      ],
-      startSlot: 200,
-      description: "Series 2 - moderate depeg",
-    },
-    {
-      ticks: [
-        { slot: 300, price: 1.00, timestamp: 1720200000 },
-        { slot: 310, price: 0.99, timestamp: 1720200010 },
-        { slot: 320, price: 0.96, timestamp: 1720200020 },
-        { slot: 330, price: 0.93, timestamp: 1720200030 },
-        { slot: 340, price: 0.89, timestamp: 1720200040 },
-      ],
-      startSlot: 300,
-      description: "Series 3 - sharp depeg",
-    },
-  ];
-}
+  const tx = new anchor.web3.Transaction().add(
+    SystemProgram.createAccount({
+      fromPubkey: payer.publicKey,
+      newAccountPubkey: priceAccount.publicKey,
+      space: PRICE_ACCOUNT_SIZE,
+      lamports: rent,
+      programId: oracleProgramId,
+    })
+  );
 
-export function loadJitoDepegSeries(): JitoDepegSeries[] {
-  try {
-    const raw = readFileSync(DATA_PATH, "utf-8");
-    return JSON.parse(raw) as JitoDepegSeries[];
-  } catch (e) {
-    // fallback to synthetic for CI/sim when data file is absent
-    console.warn("Could not load jito-depeg-series.json, using synthetic data");
-    return getSyntheticSeries();
-  }
-}
-
-export function getPriceAtSlot(series: JitoDepegSeries, targetSlot: number): number | null {
-  const sorted = [...series.ticks].sort((a, b) => a.slot - b.slot);
-  for (let i = sorted.length - 1; i >= 0; i--) {
-    if (sorted[i].slot <= targetSlot) {
-      return sorted[i].price;
-    }
-  }
-  return null;
-}
-
-export async function createTestProvider(): Promise<anchor.AnchorProvider> {
-  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
-  const wallet = new anchor.Wallet(Keypair.generate());
-  return new anchor.AnchorProvider(connection, wallet, {
+  await anchor.web3.sendAndConfirmTransaction(connection, tx, [payer.payer, priceAccount], {
     commitment: "confirmed",
-    preflightCommitment: "confirmed",
+  });
+
+  return priceAccount.publicKey;
+}
+
+export async function updatePriceAccount(
+  connection: Connection,
+  payer: anchor.Wallet,
+  priceAccount: PublicKey,
+  oracleProgramId: PublicKey,
+  price: number,
+  confidence: number = 0.01,
+  timestamp?: number
+): Promise<void> {
+  const slot = await connection.getSlot();
+  const now = timestamp || Math.floor(Date.now() / 1000);
+
+  const data = Buffer.alloc(PRICE_ACCOUNT_SIZE);
+  data.writeBigUInt64LE(BigInt(price * 1_000_000), 40); // price
+  data.writeBigUInt64LE(BigInt(confidence * 1_000_000), 48);
+  data.writeBigUInt64LE(BigInt(now), 56);
+  data.writeBigUInt64LE(BigInt(slot), 64);
+
+  const tx = new anchor.web3.Transaction().add(
+    new anchor.web3.TransactionInstruction({
+      keys: [
+        { pubkey: priceAccount, isSigner: false, isWritable: true },
+        { pubkey: payer.publicKey, isSigner: true, isWritable: false },
+      ],
+      programId: oracleProgramId,
+      data: Buffer.concat([Buffer.from([0]), data]),
+    })
+  );
+
+  await anchor.web3.sendAndConfirmTransaction(connection, tx, [payer.payer], {
+    commitment: "confirmed",
   });
 }
 
-export function getVaultProgramId(): PublicKey {
-  // Default Anchor program ID for vault (updated via anchor keys after build)
-  return new PublicKey("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+export function createLagInjector(
+  connection: Connection,
+  payer: anchor.Wallet,
+  oracleProgramId: PublicKey,
+  lagSlots: number = 180 // ~45s at ~4 slots/sec
+) {
+  let priceAccount: PublicKey | null = null;
+  let priceHistory: Array<{ price: number; slot: number; ts: number }> = [];
+
+  return {
+    async init(): Promise<PublicKey> {
+      if (!priceAccount) {
+        priceAccount = await createPriceAccount(connection, payer, oracleProgramId);
+        // seed with initial price
+        await updatePriceAccount(connection, payer, priceAccount, oracleProgramId, 1.0);
+      }
+      return priceAccount;
+    },
+
+    async injectLagPrice(currentPrice: number, currentSlot: number, currentTs: number) {
+      if (!priceAccount) throw new Error("Injector not initialized");
+      priceHistory.push({ price: currentPrice, slot: currentSlot, ts: currentTs });
+      // replay lagged price from ~lagSlots ago
+      const lagIdx = priceHistory.length - lagSlots - 1;
+      const lagged = lagIdx >= 0 ? priceHistory[lagIdx] : priceHistory[0] || { price: currentPrice, slot: currentSlot, ts: currentTs };
+      await updatePriceAccount(
+        connection,
+        payer,
+        priceAccount,
+        oracleProgramId,
+        lagged.price,
+        0.01,
+        lagged.ts
+      );
+    },
+
+    getPriceAccount(): PublicKey {
+      if (!priceAccount) throw new Error("Injector not initialized");
+      return priceAccount;
+    },
+  };
+}
+
+export async function checkTWAPFalsePositive(
+  connection: Connection,
+  vaultProgram: Program,
+  priceAccount: PublicKey,
+  jitoSolMint: PublicKey,
+  expectedTWAP: number,
+  toleranceBps: number = 50
+): Promise<boolean> {
+  // Fetch on-chain price and compute 15s TWAP
+  const accountInfo = await connection.getAccountInfo(priceAccount);
+  if (!accountInfo) return false;
+
+  const data = accountInfo.data;
+  const observedPrice = Number(data.readBigUInt64LE(40)) / 1_000_000;
+
+  const isFalsePositive = Math.abs(observedPrice - expectedTWAP) * 10000 < toleranceBps;
+  return isFalsePositive;
 }
