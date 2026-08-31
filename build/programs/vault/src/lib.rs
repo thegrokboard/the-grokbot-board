@@ -1,6 +1,5 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::sysvar::clock::Clock;
-use bytemuck::{Pod, Zeroable};
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
@@ -20,13 +19,12 @@ pub mod vault {
 
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        let cpi_accounts = anchor_lang::solana_program::system_instruction::transfer(
+        let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.user.key(),
             &ctx.accounts.buffer.key(),
             amount,
         );
-        let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
-        anchor_lang::solana_program::program::invoke(&cpi_accounts, &[ctx.accounts.user.to_account_info(), ctx.accounts.buffer.to_account_info()])?;
+        anchor_lang::solana_program::program::invoke(&transfer_ix, &[ctx.accounts.user.to_account_info(), ctx.accounts.buffer.to_account_info()])?;
         vault.protection_buffer = vault.protection_buffer.checked_add(amount).unwrap();
         Ok(())
     }
@@ -38,10 +36,7 @@ pub mod vault {
         require!(!vault.is_paused, ErrorCode::VaultPaused);
         require!(ctx.accounts.authority.key() == vault.owner, ErrorCode::Unauthorized);
 
-        let seeds = &[b"buffer".as_ref(), &[buffer.bump]];
-        let signer = &[&seeds[..]];
-
-        let transfer_amount = amount.min(buffer.lamports());
+        let transfer_amount = amount.min(buffer.to_account_info().lamports());
         **buffer.to_account_info().try_borrow_mut_lamports()? = buffer.to_account_info().lamports().checked_sub(transfer_amount).unwrap();
         **ctx.accounts.recipient.to_account_info().try_borrow_mut_lamports()? = ctx.accounts.recipient.to_account_info().lamports().checked_add(transfer_amount).unwrap();
 
@@ -86,8 +81,7 @@ pub struct Vault {
     pub buffer_bump: u8,
 }
 
-#[account(zero_copy)]
-#[derive(Copy, Clone, Pod, Zeroable)]
+#[account]
 pub struct WithdrawBuffer {
     pub bump: u8,
     pub authority: Pubkey,
