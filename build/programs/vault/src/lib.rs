@@ -130,7 +130,7 @@ pub struct Deposit<'info> {
 
 #[derive(Accounts)]
 pub struct DrawdownCircuitBreaker<'info> {
-    #[account(mut)]
+    #[account(mut, seeds = [b"vault"], bump)]
     pub vault: Account<'info, Vault>,
     #[account(mut, seeds = [b"vault_token", vault.key().as_ref()], bump)]
     pub vault_token: Account<'info, TokenAccount>,
@@ -149,7 +149,7 @@ pub struct Pause<'info> {
 
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
-    #[account(mut)]
+    #[account(mut, seeds = [b"vault"], bump)]
     pub vault: Account<'info, Vault>,
     #[account(mut, seeds = [b"vault_token", vault.key().as_ref()], bump)]
     pub vault_token: Account<'info, TokenAccount>,
