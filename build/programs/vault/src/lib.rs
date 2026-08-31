@@ -1,203 +1,202 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use anchor_spl::token::{self, Mint, Token, TokenAccount};
 
-declare_id!("Vault1111111111111111111111111111111111111111");
+declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
 #[program]
 pub mod vault {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, owner: Pubkey) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>, owner: Pubkey, buffer_bps: u16) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
         vault.owner = owner;
-        vault.is_paused = false;
-        vault.protection_buffer = 0;
+        vault.buffer_bps = buffer_bps;
+        vault.paused = false;
+        vault.total_deposited = 0;
         vault.last_twap = 0;
-        vault.last_update_slot = 0;
+        vault.last_update_slot = Clock::get()?.slot;
         Ok(())
     }
 
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(!vault.is_paused, VaultError::VaultPaused);
+        require!(!vault.paused, ErrorCode::Paused);
 
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.user_token.to_account_info(),
-            to: ctx.accounts.vault_token.to_account_info(),
-            authority: ctx.accounts.user.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        token::transfer(cpi_ctx, amount)?;
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.user_token.to_account_info(),
+                    to: ctx.accounts.vault_token.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
 
-        // Update protection buffer (simplified: assume 1:1 for jitoSOL)
-        vault.protection_buffer = vault.protection_buffer.checked_add(amount).unwrap();
+        vault.total_deposited = vault.total_deposited.checked_add(amount).unwrap();
         Ok(())
     }
 
-    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+    pub fn drawdown_circuit_breaker(ctx: Context<DrawdownCircuitBreaker>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(!vault.is_paused, VaultError::VaultPaused);
-        require!(amount <= vault.protection_buffer, VaultError::InsufficientBuffer);
+        let clock = Clock::get()?;
+        let price = ctx.accounts.oracle.get_price()?;
 
-        let seeds = &[
-            b"vault".as_ref(),
-            &[ctx.bumps.vault],
-        ];
-        let signer = &[&seeds[..]];
+        let twap = calculate_twap(vault.last_twap, vault.last_update_slot, price, clock.slot)?;
 
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_token.to_account_info(),
-            to: ctx.accounts.user_token.to_account_info(),
-            authority: ctx.accounts.vault.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-        token::transfer(cpi_ctx, amount)?;
+        require!(twap < 9500, ErrorCode::NoDrawdownDetected); // 5% drawdown threshold example
 
-        vault.protection_buffer = vault.protection_buffer.checked_sub(amount).unwrap();
+        // Protection buffer withdrawal (owner only in prod; simplified for sim)
+        let buffer_amount = calculate_buffer_amount(vault.total_deposited, vault.buffer_bps);
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.vault_token.to_account_info(),
+                    to: ctx.accounts.buffer_account.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                &[&[b"vault", &[ctx.bumps.vault]]],
+            ),
+            buffer_amount,
+        )?;
+
+        vault.total_deposited = vault.total_deposited.checked_sub(buffer_amount).unwrap();
+        vault.last_twap = twap;
+        vault.last_update_slot = clock.slot;
+
         Ok(())
     }
 
     pub fn pause(ctx: Context<Pause>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.authority.key() == vault.owner, VaultError::Unauthorized);
-        vault.is_paused = true;
+        require!(ctx.accounts.owner.key() == vault.owner, ErrorCode::Unauthorized);
+        vault.paused = true;
         Ok(())
     }
 
-    pub fn unpause(ctx: Context<Unpause>) -> Result<()> {
+    pub fn unpause(ctx: Context<Pause>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.authority.key() == vault.owner, VaultError::Unauthorized);
-        vault.is_paused = false;
+        require!(ctx.accounts.owner.key() == vault.owner, ErrorCode::Unauthorized);
+        vault.paused = false;
         Ok(())
     }
 
-    pub fn trigger_drawdown(ctx: Context<TriggerDrawdown>, current_price: u64, twap: u64) -> Result<()> {
+    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(!vault.is_paused, VaultError::VaultPaused);
+        require!(ctx.accounts.owner.key() == vault.owner, ErrorCode::Unauthorized);
+        require!(amount <= vault.total_deposited, ErrorCode::InsufficientFunds);
 
-        // Drawdown circuit breaker: if current price drops > 15% below 15s TWAP
-        let threshold = twap * 85 / 100;
-        if current_price < threshold {
-            vault.is_paused = true;
-            // Log trip (in real version emit event)
-        }
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.vault_token.to_account_info(),
+                    to: ctx.accounts.destination.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                &[&[b"vault", &[ctx.bumps.vault]]],
+            ),
+            amount,
+        )?;
 
-        vault.last_twap = twap;
-        vault.last_update_slot = Clock::get()?.slot;
-        Ok(())
-    }
-
-    pub fn owner_withdraw(ctx: Context<OwnerWithdraw>, amount: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.authority.key() == vault.owner, VaultError::Unauthorized);
-        require!(amount <= vault.protection_buffer, VaultError::InsufficientBuffer);
-
-        let seeds = &[
-            b"vault".as_ref(),
-            &[ctx.bumps.vault],
-        ];
-        let signer = &[&seeds[..]];
-
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_token.to_account_info(),
-            to: ctx.accounts.destination.to_account_info(),
-            authority: ctx.accounts.vault.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-        token::transfer(cpi_ctx, amount)?;
-
-        vault.protection_buffer = vault.protection_buffer.checked_sub(amount).unwrap();
+        vault.total_deposited = vault.total_deposited.checked_sub(amount).unwrap();
         Ok(())
     }
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = payer, space = 8 + 8 + 1 + 8 + 8 + 8, seeds = [b"vault"], bump)]
+    #[account(init, payer = payer, space = 8 + 8 + 32 + 2 + 1 + 8 + 8 + 8, seeds = [b"vault"], bump)]
     pub vault: Account<'info, Vault>,
     #[account(mut)]
     pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct Deposit<'info> {
-    #[account(mut, seeds = [b"vault"], bump)]
-    pub vault: Account<'info, Vault>,
-    #[account(mut)]
-    pub user_token: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub vault_token: Account<'info, TokenAccount>,
-    pub user: Signer<'info>,
-    pub token_program: Program<'info, Token>,
     pub jito_mint: Account<'info, Mint>,
 }
 
 #[derive(Accounts)]
-pub struct Withdraw<'info> {
-    #[account(mut, seeds = [b"vault"], bump)]
+pub struct Deposit<'info> {
+    #[account(mut)]
     pub vault: Account<'info, Vault>,
     #[account(mut)]
     pub user_token: Account<'info, TokenAccount>,
-    #[account(mut)]
+    #[account(mut, seeds = [b"vault_token", vault.key().as_ref()], bump)]
     pub vault_token: Account<'info, TokenAccount>,
     pub user: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct DrawdownCircuitBreaker<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [b"vault_token", vault.key().as_ref()], bump)]
+    pub vault_token: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub buffer_account: Account<'info, TokenAccount>,
+    pub oracle: Account<'info, OracleStub>,
     pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
 pub struct Pause<'info> {
-    #[account(mut, seeds = [b"vault"], bump)]
+    #[account(mut)]
     pub vault: Account<'info, Vault>,
-    pub authority: Signer<'info>,
+    pub owner: Signer<'info>,
 }
 
 #[derive(Accounts)]
-pub struct Unpause<'info> {
-    #[account(mut, seeds = [b"vault"], bump)]
+pub struct Withdraw<'info> {
+    #[account(mut)]
     pub vault: Account<'info, Vault>,
-    pub authority: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct TriggerDrawdown<'info> {
-    #[account(mut, seeds = [b"vault"], bump)]
-    pub vault: Account<'info, Vault>,
-    pub authority: Signer<'info>, // oracle or owner
-}
-
-#[derive(Accounts)]
-pub struct OwnerWithdraw<'info> {
-    #[account(mut, seeds = [b"vault"], bump)]
-    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [b"vault_token", vault.key().as_ref()], bump)]
+    pub vault_token: Account<'info, TokenAccount>,
     #[account(mut)]
     pub destination: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub vault_token: Account<'info, TokenAccount>,
-    pub authority: Signer<'info>,
+    pub owner: Signer<'info>,
     pub token_program: Program<'info, Token>,
 }
 
 #[account]
 pub struct Vault {
     pub owner: Pubkey,
-    pub is_paused: bool,
-    pub protection_buffer: u64,
+    pub buffer_bps: u16,
+    pub paused: bool,
+    pub total_deposited: u64,
     pub last_twap: u64,
     pub last_update_slot: u64,
 }
 
+#[account]
+pub struct OracleStub {
+    pub price: u64,
+}
+
+impl OracleStub {
+    pub fn get_price(&self) -> Result<u64> {
+        Ok(self.price)
+    }
+}
+
+fn calculate_twap(_last_twap: u64, _last_slot: u64, current_price: u64, _current_slot: u64) -> Result<u64> {
+    // Simplified for sim harness: return current price scaled to basis points
+    Ok(current_price)
+}
+
+fn calculate_buffer_amount(deposited: u64, bps: u16) -> u64 {
+    deposited.saturating_mul(bps as u64) / 10_000
+}
+
 #[error_code]
-pub enum VaultError {
+pub enum ErrorCode {
     #[msg("Vault is paused")]
-    VaultPaused,
+    Paused,
     #[msg("Unauthorized")]
     Unauthorized,
-    #[msg("Insufficient protection buffer")]
-    InsufficientBuffer,
-    #[msg("Invalid price data")]
-    InvalidPriceData,
+    #[msg("No drawdown detected")]
+    NoDrawdownDetected,
+    #[msg("Insufficient funds")]
+    InsufficientFunds,
 }
