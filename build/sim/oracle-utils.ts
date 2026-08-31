@@ -1,99 +1,92 @@
-import * as anchor from '@coral-xyz/anchor';
-import { Program, AnchorProvider, Wallet } from '@coral-xyz/anchor';
-import { PublicKey, Keypair, Connection, Transaction, SystemProgram } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
-import { Vault } from '../target/types/vault';
+import * as anchor from "@coral-xyz/anchor";
+import { PublicKey, Connection, Keypair } from "@solana/web3.js";
+import { readFileSync } from "fs";
+import { join } from "path";
 
-export const JITO_SOL_MINT = new PublicKey('J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCP');
-export const PYTH_JITO_SOL_PRICE_FEED = new PublicKey('2p4h4f8s9X2z2E6r9q5k8v7j8k9m0n1o2p3q4r5s6t');
-
-export async function getJitoSolPrice(
-  connection: Connection,
-  feed: PublicKey = PYTH_JITO_SOL_PRICE_FEED
-): Promise<number> {
-  // Simulated price fetch - in real harness this would parse Pyth account data
-  // For replay sim we will override with historical series
-  const account = await connection.getAccountInfo(feed);
-  if (!account) return 0.95; // default near depeg for testing
-  // Dummy parsing for CI - real impl would use Pyth SDK
-  return 0.92 + Math.random() * 0.1;
+export interface PriceTick {
+  slot: number;
+  price: number; // jitoSOL price in USD (e.g. 0.92)
+  timestamp: number;
 }
 
-export function createLagInjectorProvider(
-  connection: Connection,
-  payer: Keypair,
-  lagSlots: number = 150 // ~45s at 300ms/slot
-): AnchorProvider {
-  const wallet = new Wallet(payer);
-  return new AnchorProvider(
-    connection,
-    wallet,
-    { commitment: 'confirmed', preflightCommitment: 'confirmed' }
-  );
+export interface JitoDepegSeries {
+  ticks: PriceTick[];
+  startSlot: number;
+  description: string;
 }
 
-export async function setupTestVault(
-  provider: AnchorProvider,
-  program: Program<Vault>,
-  owner: Keypair
-): Promise<{
-  vault: PublicKey,
-  buffer: PublicKey,
-  jitoMint: PublicKey
-}> {
-  const [vaultPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from('vault')],
-    program.programId
-  );
+// Path to the replay data (assumed to be committed or generated; for sim we use a minimal synthetic dataset)
+const DATA_PATH = join(__dirname, "jito-depeg-series.json");
 
-  const [bufferPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from('protection_buffer')],
-    program.programId
-  );
+// Minimal synthetic 3-series dataset for the sim (real data would be loaded from file)
+function getSyntheticSeries(): JitoDepegSeries[] {
+  return [
+    {
+      ticks: [
+        { slot: 100, price: 1.00, timestamp: 1720000000 },
+        { slot: 110, price: 0.98, timestamp: 1720000010 },
+        { slot: 120, price: 0.95, timestamp: 1720000020 },
+        { slot: 130, price: 0.88, timestamp: 1720000030 },
+        { slot: 140, price: 0.85, timestamp: 1720000040 },
+      ],
+      startSlot: 100,
+      description: "Series 1 - mild depeg",
+    },
+    {
+      ticks: [
+        { slot: 200, price: 1.00, timestamp: 1720100000 },
+        { slot: 210, price: 0.97, timestamp: 1720100010 },
+        { slot: 220, price: 0.94, timestamp: 1720100020 },
+        { slot: 230, price: 0.91, timestamp: 1720100030 },
+      ],
+      startSlot: 200,
+      description: "Series 2 - moderate depeg",
+    },
+    {
+      ticks: [
+        { slot: 300, price: 1.00, timestamp: 1720200000 },
+        { slot: 310, price: 0.99, timestamp: 1720200010 },
+        { slot: 320, price: 0.96, timestamp: 1720200020 },
+        { slot: 330, price: 0.93, timestamp: 1720200030 },
+        { slot: 340, price: 0.89, timestamp: 1720200040 },
+      ],
+      startSlot: 300,
+      description: "Series 3 - sharp depeg",
+    },
+  ];
+}
 
-  // Initialize if needed (idempotent in sim)
+export function loadJitoDepegSeries(): JitoDepegSeries[] {
   try {
-    await program.methods
-      .initialize()
-      .accounts({
-        vault: vaultPda,
-        buffer: bufferPda,
-        owner: owner.publicKey,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([owner])
-      .rpc();
+    const raw = readFileSync(DATA_PATH, "utf-8");
+    return JSON.parse(raw) as JitoDepegSeries[];
   } catch (e) {
-    // Already initialized is acceptable in test harness
-    if (!e.toString().includes('already in use')) {
-      console.warn('Vault init warning:', e);
+    // fallback to synthetic for CI/sim when data file is absent
+    console.warn("Could not load jito-depeg-series.json, using synthetic data");
+    return getSyntheticSeries();
+  }
+}
+
+export function getPriceAtSlot(series: JitoDepegSeries, targetSlot: number): number | null {
+  const sorted = [...series.ticks].sort((a, b) => a.slot - b.slot);
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    if (sorted[i].slot <= targetSlot) {
+      return sorted[i].price;
     }
   }
-
-  return {
-    vault: vaultPda,
-    buffer: bufferPda,
-    jitoMint: JITO_SOL_MINT,
-  };
+  return null;
 }
 
-export function generateHistoricalPriceSeries(): Array<{ slot: number; price: number }> {
-  // Last three known JitoSOL depeg events (simplified synthetic series for replay)
-  const series: Array<{ slot: number; price: number }> = [];
-  let baseSlot = 100000;
-  // Series 1: gradual depeg
-  for (let i = 0; i < 30; i++) {
-    series.push({ slot: baseSlot + i * 5, price: 0.98 - i * 0.015 });
-  }
-  // Series 2: sharp crash
-  baseSlot += 200;
-  for (let i = 0; i < 25; i++) {
-    series.push({ slot: baseSlot + i * 4, price: 0.85 - i * 0.022 });
-  }
-  // Series 3: recovery with volatility
-  baseSlot += 180;
-  for (let i = 0; i < 35; i++) {
-    series.push({ slot: baseSlot + i * 6, price: 0.65 + (i % 7) * 0.04 });
-  }
-  return series;
+export async function createTestProvider(): Promise<anchor.AnchorProvider> {
+  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
+  const wallet = new anchor.Wallet(Keypair.generate());
+  return new anchor.AnchorProvider(connection, wallet, {
+    commitment: "confirmed",
+    preflightCommitment: "confirmed",
+  });
+}
+
+export function getVaultProgramId(): PublicKey {
+  // Default Anchor program ID for vault (updated via anchor keys after build)
+  return new PublicKey("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 }
