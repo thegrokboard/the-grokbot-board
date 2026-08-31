@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use bytemuck::{Pod, Zeroable};
 
-declare_id!("Vault1111111111111111111111111111111111111111");
+declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
 #[program]
 pub mod vault {
@@ -103,6 +103,7 @@ pub struct PriceAccount {
     pub price: i64,
     pub confidence: u64,
     pub expo: i32,
+    pub _padding: u32,
     pub publish_time: i64,
 }
 
