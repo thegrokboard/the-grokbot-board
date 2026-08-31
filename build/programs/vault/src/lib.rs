@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount};
+use anchor_spl::token::{self, Token, TokenAccount, Mint};
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
@@ -7,220 +7,191 @@ declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 pub mod vault {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, owner: Pubkey, buffer_bump: u8) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>, bump: u8) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        vault.owner = owner;
-        vault.jito_sol_mint = ctx.accounts.jito_sol_mint.key();
-        vault.buffer_bump = buffer_bump;
+        vault.owner = *ctx.accounts.owner.key;
+        vault.jito_mint = ctx.accounts.jito_mint.key();
+        vault.protection_buffer = ctx.accounts.protection_buffer.key();
         vault.is_paused = false;
-        vault.last_twap = 0;
-        vault.last_slot = 0;
+        vault.bump = bump;
         Ok(())
     }
 
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         let vault = &ctx.accounts.vault;
-        require!(!vault.is_paused, VaultError::VaultPaused);
+        require!(!vault.is_paused, ErrorCode::VaultPaused);
 
         let cpi_accounts = token::Transfer {
-            from: ctx.accounts.user_token.to_account_info(),
-            to: ctx.accounts.vault_token.to_account_info(),
+            from: ctx.accounts.user_jito_account.to_account_info(),
+            to: ctx.accounts.vault_jito_account.to_account_info(),
             authority: ctx.accounts.user.to_account_info(),
         };
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         token::transfer(cpi_ctx, amount)?;
 
-        // Update protection buffer tracking (simplified on-chain)
-        let buffer = &mut ctx.accounts.protection_buffer;
-        buffer.total_deposited = buffer
-            .total_deposited
-            .checked_add(amount)
-            .ok_or(VaultError::Overflow)?;
+        Ok(())
+    }
+
+    pub fn drawdown(ctx: Context<Drawdown>) -> Result<()> {
+        let vault = &ctx.accounts.vault;
+        require!(!vault.is_paused, ErrorCode::VaultPaused);
+
+        let price = ctx.accounts.oracle.load()?.price;
+        let buffer_amount = ctx.accounts.protection_buffer.amount;
+
+        // Simple drawdown circuit breaker logic for sim (trip if price < 0.9)
+        if price < 90_000_000 {
+            // In a real system this would trigger a breaker event; here we just pause
+            let vault = &mut ctx.accounts.vault;
+            vault.is_paused = true;
+            return Err(ErrorCode::CircuitBreakerTripped.into());
+        }
 
         Ok(())
     }
 
     pub fn pause(ctx: Context<Pause>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.owner.key() == vault.owner, VaultError::Unauthorized);
+        require!(ctx.accounts.owner.key() == vault.owner, ErrorCode::Unauthorized);
         vault.is_paused = true;
         Ok(())
     }
 
-    pub fn unpause(ctx: Context<Unpause>) -> Result<()> {
+    pub fn unpause(ctx: Context<Pause>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.owner.key() == vault.owner, VaultError::Unauthorized);
+        require!(ctx.accounts.owner.key() == vault.owner, ErrorCode::Unauthorized);
         vault.is_paused = false;
-        Ok(())
-    }
-
-    pub fn trigger_drawdown(ctx: Context<TriggerDrawdown>, current_price: u64, twap: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        require!(!vault.is_paused, VaultError::VaultPaused);
-
-        // Simple 15% drawdown circuit breaker
-        let threshold = vault.last_twap * 85 / 100;
-        if current_price < threshold && twap < threshold {
-            vault.is_paused = true;
-            emit!(DrawdownTriggered {
-                current_price,
-                twap,
-                slot: Clock::get()?.slot,
-            });
-        }
-
-        vault.last_twap = twap;
-        vault.last_slot = Clock::get()?.slot;
         Ok(())
     }
 
     pub fn withdraw_buffer(ctx: Context<WithdrawBuffer>, amount: u64) -> Result<()> {
         let vault = &ctx.accounts.vault;
-        require!(ctx.accounts.owner.key() == vault.owner, VaultError::Unauthorized);
-        require!(vault.is_paused, VaultError::NotPaused);
+        require!(ctx.accounts.owner.key() == vault.owner, ErrorCode::Unauthorized);
+        require!(!vault.is_paused, ErrorCode::VaultPaused);
 
-        let buffer = &mut ctx.accounts.protection_buffer;
-        require!(
-            amount <= buffer.total_deposited,
-            VaultError::InsufficientBuffer
-        );
-
-        let seeds = &[
-            b"protection_buffer".as_ref(),
-            &vault.key().to_bytes()[..],
-            &[vault.buffer_bump],
-        ];
+        let seeds = &[b"vault".as_ref(), &[vault.bump]];
         let signer = &[&seeds[..]];
 
         let cpi_accounts = token::Transfer {
-            from: ctx.accounts.buffer_token.to_account_info(),
-            to: ctx.accounts.destination.to_account_info(),
-            authority: ctx.accounts.buffer_account.to_account_info(),
+            from: ctx.accounts.vault_jito_account.to_account_info(),
+            to: ctx.accounts.owner_jito_account.to_account_info(),
+            authority: ctx.accounts.vault.to_account_info(),
         };
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
         token::transfer(cpi_ctx, amount)?;
-
-        buffer.total_deposited = buffer
-            .total_deposited
-            .checked_sub(amount)
-            .ok_or(VaultError::Overflow)?;
 
         Ok(())
     }
 }
 
 #[derive(Accounts)]
-#[instruction(owner: Pubkey, buffer_bump: u8)]
+#[instruction(bump: u8)]
 pub struct Initialize<'info> {
-    #[account(init, payer = payer, space = 8 + Vault::LEN)]
-    pub vault: Account<'info, Vault>,
-    pub jito_sol_mint: Account<'info, Mint>,
     #[account(
         init,
-        payer = payer,
-        seeds = [b"protection_buffer", vault.key().as_ref()],
-        bump = buffer_bump,
-        space = 8 + ProtectionBuffer::LEN
+        payer = owner,
+        space = 8 + 32 + 32 + 32 + 1 + 1,
+        seeds = [b"vault"],
+        bump
     )]
-    pub protection_buffer: Account<'info, ProtectionBuffer>,
+    pub vault: Account<'info, Vault>,
     #[account(mut)]
-    pub payer: Signer<'info>,
+    pub owner: Signer<'info>,
+    pub jito_mint: Account<'info, Mint>,
+    #[account(
+        init,
+        payer = owner,
+        seeds = [b"buffer"],
+        bump,
+        token::mint = jito_mint,
+        token::authority = vault
+    )]
+    pub protection_buffer: Account<'info, TokenAccount>,
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
 pub struct Deposit<'info> {
-    #[account(mut)]
+    #[account(
+        seeds = [b"vault"],
+        bump = vault.bump
+    )]
     pub vault: Account<'info, Vault>,
     #[account(mut)]
-    pub protection_buffer: Account<'info, ProtectionBuffer>,
-    #[account(mut)]
-    pub user_token: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub vault_token: Account<'info, TokenAccount>,
     pub user: Signer<'info>,
+    #[account(mut)]
+    pub user_jito_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub vault_jito_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
+pub struct Drawdown<'info> {
+    #[account(
+        seeds = [b"vault"],
+        bump = vault.bump
+    )]
+    pub vault: Account<'info, Vault>,
+    #[account(mut)]
+    pub protection_buffer: Account<'info, TokenAccount>,
+    /// CHECK: oracle loaded in handler
+    pub oracle: AccountLoader<'info, OraclePrice>,
+}
+
+#[derive(Accounts)]
 pub struct Pause<'info> {
-    #[account(mut)]
+    #[account(
+        mut,
+        seeds = [b"vault"],
+        bump = vault.bump
+    )]
     pub vault: Account<'info, Vault>,
     pub owner: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct Unpause<'info> {
-    #[account(mut)]
-    pub vault: Account<'info, Vault>,
-    pub owner: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct TriggerDrawdown<'info> {
-    #[account(mut)]
-    pub vault: Account<'info, Vault>,
-    // Oracle data passed via remaining accounts or CPI in real deployment
 }
 
 #[derive(Accounts)]
 pub struct WithdrawBuffer<'info> {
-    #[account(mut)]
+    #[account(
+        seeds = [b"vault"],
+        bump = vault.bump
+    )]
     pub vault: Account<'info, Vault>,
     #[account(mut)]
-    pub protection_buffer: Account<'info, ProtectionBuffer>,
-    #[account(mut)]
-    pub buffer_token: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub destination: Account<'info, TokenAccount>,
     pub owner: Signer<'info>,
-    pub buffer_account: SystemAccount<'info>, // PDA signer
+    #[account(mut)]
+    pub owner_jito_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub vault_jito_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 }
 
 #[account]
 pub struct Vault {
     pub owner: Pubkey,
-    pub jito_sol_mint: Pubkey,
-    pub buffer_bump: u8,
+    pub jito_mint: Pubkey,
+    pub protection_buffer: Pubkey,
     pub is_paused: bool,
-    pub last_twap: u64,
-    pub last_slot: u64,
+    pub bump: u8,
 }
 
-impl Vault {
-    pub const LEN: usize = 32 + 32 + 1 + 1 + 8 + 8;
-}
-
-#[account]
-pub struct ProtectionBuffer {
-    pub total_deposited: u64,
-}
-
-impl ProtectionBuffer {
-    pub const LEN: usize = 8;
-}
-
-#[event]
-pub struct DrawdownTriggered {
-    pub current_price: u64,
-    pub twap: u64,
-    pub slot: u64,
+#[account(zero_copy)]
+pub struct OraclePrice {
+    pub price: i64,
+    // padding to simulate Switchboard/Jito oracle layout for sim
+    pub _padding: [u8; 64],
 }
 
 #[error_code]
-pub enum VaultError {
-    #[msg("Unauthorized")]
-    Unauthorized,
+pub enum ErrorCode {
     #[msg("Vault is paused")]
     VaultPaused,
-    #[msg("Vault is not paused")]
-    NotPaused,
-    #[msg("Insufficient buffer balance")]
-    InsufficientBuffer,
-    #[msg("Arithmetic overflow")]
-    Overflow,
+    #[msg("Circuit breaker tripped")]
+    CircuitBreakerTripped,
+    #[msg("Unauthorized")]
+    Unauthorized,
 }
