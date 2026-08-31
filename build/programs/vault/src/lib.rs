@@ -172,14 +172,24 @@ pub struct PriceAccount {
 
 impl anchor_lang::Owner for PriceAccount {
     fn owner() -> Pubkey {
-        // Use the Switchboard oracle program ID for the sim (common for Jito price feeds)
-        Pubkey::from_str_const("SW1TCH7qEPTdLsDHRgXhFzQH9f4Vv4q2vA5tVv9cF5J")
+        // Sim stub: price accounts are owned by this program in the test-validator sim
+        crate::ID
     }
 }
 
-// Anchor requires these for custom non-#[account] types used in Account<'info, T>
+// Anchor requires these for custom non-#[account] types used in Account<'info, T>.
+// AccountSerialize has a default no-op try_serialize, fine for a read-only oracle account.
 impl anchor_lang::AccountSerialize for PriceAccount {}
-impl anchor_lang::AccountDeserialize for PriceAccount {}
+
+impl anchor_lang::AccountDeserialize for PriceAccount {
+    fn try_deserialize_unchecked(buf: &mut &[u8]) -> Result<Self> {
+        let size = core::mem::size_of::<PriceAccount>();
+        if buf.len() < size {
+            return Err(anchor_lang::error::ErrorCode::AccountDidNotDeserialize.into());
+        }
+        Ok(bytemuck::pod_read_unaligned::<PriceAccount>(&buf[..size]))
+    }
+}
 
 #[error_code]
 pub enum VaultError {
