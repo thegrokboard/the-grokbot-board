@@ -1,131 +1,122 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::sysvar::clock::Clock;
+use anchor_lang::solana_program::pubkey::Pubkey;
 use bytemuck::{Pod, Zeroable};
 
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg4t5n1v7nA");
 
 #[program]
 pub mod vault {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        vault.owner = *ctx.accounts.owner.key;
-        vault.is_paused = false;
-        vault.jito_sol_mint = ctx.accounts.jito_sol_mint.key();
-        vault.protection_buffer = ctx.accounts.protection_buffer.key();
-        vault.last_twap = 0;
-        vault.drawdown_threshold = 500; // 5% in basis points
+    pub fn initialize(ctx: Context<Initialize>, owner: Pubkey, buffer_bump: u8) -> Result<()> {
+        let state = &mut ctx.accounts.vault_state;
+        state.owner = owner;
+        state.buffer_bump = buffer_bump;
+        state.is_paused = false;
+        state.last_twap = 0;
+        state.last_update_slot = 0;
         Ok(())
     }
 
-    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        require!(!vault.is_paused, VaultError::VaultPaused);
+    pub fn deposit_jitosol(ctx: Context<DepositJitoSol>, amount: u64) -> Result<()> {
+        let state = &mut ctx.accounts.vault_state;
+        if state.is_paused {
+            return Err(error!(ErrorCode::VaultPaused));
+        }
+        // In a real vault this would CPI to the Jito stake pool.
+        // For the sim we simply record the deposit.
+        state.total_assets = state.total_assets.saturating_add(amount);
+        Ok(())
+    }
 
-        let cpi_accounts = anchor_lang::solana_program::system_instruction::transfer(
-            &ctx.accounts.user.key(),
-            &ctx.accounts.vault.key(),
-            amount,
-        );
-        anchor_lang::solana_program::program::invoke(
-            &cpi_accounts,
-            &[
-                ctx.accounts.user.to_account_info(),
-                ctx.accounts.vault.to_account_info(),
-            ],
-        )?;
+    pub fn update_twap(ctx: Context<UpdateTwap>, new_twap: u64, current_slot: u64) -> Result<()> {
+        let state = &mut ctx.accounts.vault_state;
+        if state.is_paused {
+            return Err(error!(ErrorCode::VaultPaused));
+        }
+        state.last_twap = new_twap;
+        state.last_update_slot = current_slot;
+        Ok(())
+    }
 
-        // In real implementation this would handle jitoSOL SPL transfer
-        // For sim we accept native for buffer top-up
+    pub fn drawdown_circuit_breaker(ctx: Context<DrawdownCircuitBreaker>) -> Result<()> {
+        let state = &mut ctx.accounts.vault_state;
+        let price_account = &ctx.accounts.price_account;
+
+        // Simple depeg detection for the sim: if price < 0.95 * 1e9 we trip.
+        if price_account.price < 950_000_000 {
+            state.is_paused = true;
+        }
         Ok(())
     }
 
     pub fn owner_pause(ctx: Context<OwnerPause>) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.owner.key() == vault.owner, VaultError::Unauthorized);
-        vault.is_paused = true;
+        let state = &mut ctx.accounts.vault_state;
+        require!(ctx.accounts.owner.key() == state.owner, ErrorCode::Unauthorized);
+        state.is_paused = true;
         Ok(())
     }
 
     pub fn owner_withdraw(ctx: Context<OwnerWithdraw>, amount: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.signer.key() == vault.owner, VaultError::Unauthorized);
-        require!(vault.is_paused, VaultError::VaultNotPaused);
+        let state = &mut ctx.accounts.vault_state;
+        require!(ctx.accounts.owner.key() == state.owner, ErrorCode::Unauthorized);
+        require!(state.is_paused, ErrorCode::NotPaused);
 
-        **ctx.accounts.vault.lamports.borrow_mut() -= amount;
-        **ctx.accounts.destination.lamports.borrow_mut() += amount;
+        let vault_lamports = ctx.accounts.vault_state.to_account_info().lamports();
+        require!(*vault_lamports >= amount, ErrorCode::InsufficientFunds);
 
-        Ok(())
-    }
+        **ctx.accounts.vault_state.to_account_info().try_borrow_mut_lamports()? -= amount;
+        **ctx.accounts.recipient.try_borrow_mut_lamports()? += amount;
 
-    pub fn check_drawdown(ctx: Context<CheckDrawdown>) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        let clock = Clock::get()?;
-
-        // Simplified TWAP check using oracle price feed (in sim this is updated by lag injector)
-        let current_price = ctx.accounts.oracle_price.get_price();
-        let twap = vault.last_twap;
-
-        let drawdown_bps = if current_price < twap {
-            ((twap - current_price) * 10000) / twap
-        } else {
-            0
-        };
-
-        if drawdown_bps > vault.drawdown_threshold {
-            vault.is_paused = true;
-            msg!("Drawdown circuit breaker tripped! Drawdown: {} bps", drawdown_bps);
-        }
-
-        // Update last TWAP (in real this would be proper 15s TWAP calculation)
-        vault.last_twap = current_price;
         Ok(())
     }
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = owner, space = 8 + 128, seeds = [b"vault"], bump)]
-    pub vault: Account<'info, VaultState>,
+    #[account(init, payer = payer, space = 8 + 8 + 32 + 1 + 8 + 8)]
+    pub vault_state: Account<'info, VaultState>,
     #[account(mut)]
-    pub owner: Signer<'info>,
-    pub jito_sol_mint: AccountInfo<'info>,
-    #[account(seeds = [b"protection_buffer", vault.key().as_ref()], bump)]
-    pub protection_buffer: AccountInfo<'info>,
+    pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct Deposit<'info> {
+pub struct DepositJitoSol<'info> {
     #[account(mut)]
-    pub vault: Account<'info, VaultState>,
-    #[account(mut)]
+    pub vault_state: Account<'info, VaultState>,
     pub user: Signer<'info>,
-    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateTwap<'info> {
+    #[account(mut)]
+    pub vault_state: Account<'info, VaultState>,
+    pub oracle: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct DrawdownCircuitBreaker<'info> {
+    #[account(mut)]
+    pub vault_state: Account<'info, VaultState>,
+    pub price_account: Account<'info, PriceAccount>,
 }
 
 #[derive(Accounts)]
 pub struct OwnerPause<'info> {
     #[account(mut)]
-    pub vault: Account<'info, VaultState>,
+    pub vault_state: Account<'info, VaultState>,
     pub owner: Signer<'info>,
 }
 
 #[derive(Accounts)]
 pub struct OwnerWithdraw<'info> {
     #[account(mut)]
-    pub vault: Account<'info, VaultState>,
+    pub vault_state: Account<'info, VaultState>,
+    pub owner: Signer<'info>,
+    /// CHECK: recipient of withdrawn funds
     #[account(mut)]
-    pub destination: SystemAccount<'info>,
-    pub signer: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct CheckDrawdown<'info> {
-    #[account(mut)]
-    pub vault: Account<'info, VaultState>,
-    pub oracle_price: Account<'info, PriceAccount>,
+    pub recipient: UncheckedAccount<'info>,
 }
 
 #[account]
@@ -133,14 +124,13 @@ pub struct CheckDrawdown<'info> {
 pub struct VaultState {
     pub owner: Pubkey,
     pub is_paused: bool,
-    pub jito_sol_mint: Pubkey,
-    pub protection_buffer: Pubkey,
+    pub buffer_bump: u8,
+    pub total_assets: u64,
     pub last_twap: u64,
-    pub drawdown_threshold: u64,
+    pub last_update_slot: u64,
 }
 
-#[account]
-#[derive(Copy, Clone, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct PriceAccount {
     pub price: u64,
@@ -148,18 +138,14 @@ pub struct PriceAccount {
     pub _padding: [u8; 16],
 }
 
-impl PriceAccount {
-    pub fn get_price(&self) -> u64 {
-        self.price
-    }
-}
-
 #[error_code]
-pub enum VaultError {
-    #[msg("Vault is paused")]
-    VaultPaused,
-    #[msg("Vault is not paused")]
-    VaultNotPaused,
+pub enum ErrorCode {
     #[msg("Unauthorized")]
     Unauthorized,
+    #[msg("Vault is paused")]
+    VaultPaused,
+    #[msg("Must be paused to withdraw")]
+    NotPaused,
+    #[msg("Insufficient funds")]
+    InsufficientFunds,
 }
