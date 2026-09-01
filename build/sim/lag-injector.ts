@@ -1,74 +1,90 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { TestOracle, PriceData } from "./oracle-utils";
+import { Connection, Keypair, PublicKey, Transaction, SystemProgram } from "@solana/web3.js";
+import { PriceData } from "./oracle-utils";
 
-export interface OracleConfig {
-  oracle: PublicKey;
-  price: number;
-  confidence: number;
-  timestamp: number;
+export interface TestOracle {
+  publicKey: PublicKey;
+  setPrice: (price: number, conf: number, slot: number) => Promise<void>;
 }
 
 export class LagInjector {
   private connection: Connection;
+  private programId: PublicKey;
   private oracle: TestOracle;
   private lagSlots: number;
-  private priceHistory: PriceData[] = [];
+  private priceHistory: Array<{ price: number; slot: number; conf: number }> = [];
+  private currentSlot = 0;
 
   constructor(
     connection: Connection,
-    oraclePubkey: PublicKey,
+    programId: PublicKey,
+    oracle: TestOracle,
     lagSeconds: number = 45
   ) {
     this.connection = connection;
-    this.oracle = new TestOracle(oraclePubkey);
-    this.lagSlots = Math.floor((lagSeconds * 2)); // ~2 slots per second on local validator
+    this.programId = programId;
+    this.oracle = oracle;
+    this.lagSlots = Math.floor(lagSeconds * 2); // ~2 slots per second on test validator
   }
 
-  async loadHistory(prices: OracleConfig[]): Promise<void> {
-    this.priceHistory = prices.map((p, i) => ({
-      price: p.price,
-      confidence: p.confidence,
-      timestamp: p.timestamp,
-      // no slot field per oracle-utils
-    }));
+  async advanceSlot(count: number = 1): Promise<number> {
+    this.currentSlot += count;
+    return this.currentSlot;
   }
 
-  async injectWithLag(currentSlot: number): Promise<void> {
-    const lagIndex = Math.max(0, this.priceHistory.length - this.lagSlots - 1);
-    if (lagIndex >= this.priceHistory.length) return;
-
-    const delayedPrice = this.priceHistory[lagIndex];
-    await this.oracle.setPrice(
-      this.connection,
-      delayedPrice.price,
-      delayedPrice.confidence,
-      delayedPrice.timestamp
-    );
+  getCurrentSlot(): number {
+    return this.currentSlot;
   }
 
-  getCurrentLag(): number {
-    return this.lagSlots;
+  pushPrice(price: number, conf: number = 0.1): void {
+    this.priceHistory.push({
+      price,
+      slot: this.currentSlot,
+      conf,
+    });
+    // keep only last 1000 samples
+    if (this.priceHistory.length > 1000) {
+      this.priceHistory.shift();
+    }
+  }
+
+  async injectLagPrice(): Promise<void> {
+    const targetSlot = this.currentSlot - this.lagSlots;
+    if (targetSlot < 0) {
+      // not enough history yet - use latest price
+      if (this.priceHistory.length > 0) {
+        const latest = this.priceHistory[this.priceHistory.length - 1];
+        await this.oracle.setPrice(latest.price, latest.conf, this.currentSlot);
+      }
+      return;
+    }
+
+    // find price closest to (but not after) targetSlot
+    let best = this.priceHistory[0];
+    for (const p of this.priceHistory) {
+      if (p.slot <= targetSlot && p.slot > best.slot) {
+        best = p;
+      }
+    }
+
+    await this.oracle.setPrice(best.price, best.conf, this.currentSlot);
+  }
+
+  // replay a price series with lag
+  async replaySeries(prices: number[], slotsPerTick: number = 4): Promise<void> {
+    for (let i = 0; i < prices.length; i++) {
+      this.pushPrice(prices[i]);
+      await this.advanceSlot(slotsPerTick);
+      await this.injectLagPrice();
+    }
   }
 }
 
-// Helper to replay last three Jito depeg series (example data - real replay would load from JSON)
-export async function replayJitoDepegSeries(
+export function createLagInjector(
   connection: Connection,
-  oraclePubkey: PublicKey,
+  programId: PublicKey,
+  oracle: TestOracle,
   lagSeconds: number = 45
-): Promise<LagInjector> {
-  const injector = new LagInjector(connection, oraclePubkey, lagSeconds);
-
-  // Simulated last three depeg price series (price in USD * 1e9 for onchain precision)
-  const series: OracleConfig[] = [
-    { oracle: oraclePubkey, price: 0.92 * 1e9, confidence: 0.01 * 1e9, timestamp: Date.now() / 1000 - 180 },
-    { oracle: oraclePubkey, price: 0.85 * 1e9, confidence: 0.02 * 1e9, timestamp: Date.now() / 1000 - 120 },
-    { oracle: oraclePubkey, price: 0.78 * 1e9, confidence: 0.03 * 1e9, timestamp: Date.now() / 1000 - 60 },
-    { oracle: oraclePubkey, price: 0.95 * 1e9, confidence: 0.01 * 1e9, timestamp: Date.now() / 1000 - 30 },
-    { oracle: oraclePubkey, price: 0.99 * 1e9, confidence: 0.005 * 1e9, timestamp: Date.now() / 1000 },
-  ];
-
-  await injector.loadHistory(series);
-  return injector;
+): LagInjector {
+  return new LagInjector(connection, programId, oracle, lagSeconds);
 }
