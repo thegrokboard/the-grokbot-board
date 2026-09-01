@@ -1,12 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Keypair, SystemProgram, Connection } from "@solana/web3.js";
-import { Program } from "@coral-xyz/anchor";
-
-export interface OracleConfig {
-  programId: PublicKey;
-  priceAccount: PublicKey;
-  owner: Keypair;
-}
+import { PublicKey, Keypair, Connection, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { PythSolanaReceiver } from "@pythnetwork/pyth-solana-receiver";
 
 export interface PriceData {
   price: number;
@@ -14,91 +8,52 @@ export interface PriceData {
   timestamp: number;
 }
 
-export interface TestOracle {
-  config: OracleConfig;
-  connection: Connection;
-  program: Program;
+export interface OracleConfig {
+  feedPubkey: PublicKey;
+  priceAccount: PublicKey;
 }
 
-export async function createTestOracle(
+export interface TestOracle {
+  pubkey: PublicKey;
+  toBase58(): string;
+}
+
+export function createTestOracle(
   connection: Connection,
-  owner: Keypair
-): Promise<TestOracle> {
-  const programId = new PublicKey("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"); // placeholder for test
-  const priceAccount = Keypair.generate();
-
-  // Create a minimal price account
-  const lamports = await connection.getMinimumBalanceForRentExemption(200);
-  const tx = new anchor.web3.Transaction().add(
-    SystemProgram.createAccount({
-      fromPubkey: owner.publicKey,
-      newAccountPubkey: priceAccount.publicKey,
-      lamports,
-      space: 200,
-      programId,
-    })
-  );
-  await anchor.web3.sendAndConfirmTransaction(connection, tx, [owner, priceAccount]);
-
-  const config: OracleConfig = {
-    programId,
-    priceAccount: priceAccount.publicKey,
-    owner,
-  };
-
-  // Minimal mock program for sim
-  const program = {
-    methods: {
-      updatePrice: (price: number, confidence: number) => ({
-        accounts: { priceAccount: config.priceAccount, owner: config.owner.publicKey },
-        rpc: async () => {
-          // mock update
-          await new Promise((r) => setTimeout(r, 10));
-          return "mock-tx";
-        },
-      }),
-    },
-  } as any;
-
+  program: any
+): TestOracle {
+  // For sim we use a deterministic dummy key that matches expected test oracle in tick-runner
+  const dummy = new PublicKey("11111111111111111111111111111112");
   return {
-    config,
-    connection,
-    program,
+    pubkey: dummy,
+    toBase58: () => dummy.toBase58(),
   };
 }
 
 export async function updateTestOracle(
-  oracle: TestOracle,
-  price: number,
-  confidence: number = 0.01,
-  timestamp?: number
-): Promise<string> {
-  const ts = timestamp || Math.floor(Date.now() / 1000);
-  // In real sim this would call the oracle program; here we mock the on-chain update
-  await oracle.program.methods
-    .updatePrice(price, confidence)
-    .accounts({
-      priceAccount: oracle.config.priceAccount,
-      owner: oracle.config.owner.publicKey,
-    })
-    .signers([oracle.config.owner])
-    .rpc();
-
-  // Return the price account pubkey as identifier
-  return oracle.config.priceAccount.toBase58();
-}
-
-export function createPriceAccount(): PublicKey {
-  return Keypair.generate().publicKey;
-}
-
-export async function updatePriceAccount(
   connection: Connection,
-  priceAccount: PublicKey,
-  price: number,
-  confidence: number,
-  timestamp: number
+  oracle: TestOracle,
+  priceData: PriceData,
+  program: any,
+  payer: Keypair
 ): Promise<void> {
-  // Mock on-chain update for the test harness
-  console.log(`[mock] Updated oracle ${priceAccount.toBase58()} to price=${price} conf=${confidence} ts=${timestamp}`);
+  // In pure-onchain test validator sim we simply log; real update would go through pyth receiver
+  // but lag-injector and tick-runner only care that it "succeeds" for the harness
+  console.log(`[oracle-utils] updateTestOracle slot=${(priceData as any).slot || 0} price=${priceData.price}`);
+  // No-op for CI; the actual price injection lives in lag-injector
+}
+
+export function createOracleConfig(feedPubkey: PublicKey): OracleConfig {
+  return {
+    feedPubkey,
+    priceAccount: feedPubkey, // same key for test harness
+  };
+}
+
+export function priceToTwapCompatible(priceData: PriceData): any {
+  return {
+    price: priceData.price,
+    confidence: priceData.confidence,
+    timestamp: priceData.timestamp,
+  };
 }
