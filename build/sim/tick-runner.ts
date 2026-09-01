@@ -1,147 +1,130 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
-import { LagInjector } from "./lag-injector";
+import { PublicKey, Connection, Keypair } from "@solana/web3.js";
+import { LagInjector, createLagInjector } from "./lag-injector";
 import { checkTWAPFalsePositive } from "./twap-checker";
-import { createTestOracle, PriceData, updateTestOracle } from "./oracle-utils";
-import { Vault } from "../target/types/vault";
+import { TestOracle, PriceData, createTestOracle, updateTestOraclePrice } from "./oracle-utils";
 
-const CLUSTER_URL = "http://127.0.0.1:8899";
-const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhT1e1qMkk3bJ4f8s1q6q3j3q3q"); // placeholder for sim
-const ORACLE_UPDATE_INTERVAL = 15; // seconds
-const SIM_DURATION_SLOTS = 7 * 24 * 60 * 60 * 2; // ~7 days at ~2 slots/sec
-
-interface SimulationLog {
-  slot: number;
-  price: number;
-  twap: number;
-  breakerTripped: boolean;
+interface SimResult {
+  breakerShouldTrip: boolean;
   isFalsePositive: boolean;
+  twap: number | null;
+  breakerTrips: number;
+  falsePositives: number;
 }
 
-async function runSimulation() {
-  const connection = new Connection(CLUSTER_URL, "confirmed");
-  const wallet = Keypair.generate();
-  const provider = new anchor.AnchorProvider(connection, new anchor.Wallet(wallet), {
-    commitment: "confirmed",
-  });
+async function runTick(
+  lagInjector: LagInjector,
+  testOracle: TestOracle,
+  currentSlot: number,
+  priceSeries: PriceData[],
+  lagSlots: number,
+  twapWindow: number
+): Promise<SimResult> {
+  // Replay next price with lag
+  const priceIndex = Math.floor(currentSlot / 5) % priceSeries.length;
+  const priceData = priceSeries[priceIndex];
+  
+  await lagInjector.setPrice(priceData.price);
+  await lagInjector.injectLagPrice(testOracle.pubkey, currentSlot, lagSlots);
+
+  // Update on-chain oracle
+  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
+  await updateTestOraclePrice(connection, testOracle, priceData.price, new anchor.Wallet(Keypair.generate()));
+
+  // Check TWAP
+  const twapResult = checkTWAPFalsePositive(priceSeries, currentSlot, twapWindow);
+  
+  const shouldTrip = typeof twapResult === "object" ? twapResult.breakerShouldTrip : false;
+  const isFalsePositive = typeof twapResult === "object" ? twapResult.isFalsePositive : false;
+  const twapValue = typeof twapResult === "object" ? twapResult.twap : null;
+
+  return {
+    breakerShouldTrip: shouldTrip,
+    isFalsePositive: isFalsePositive,
+    twap: twapValue,
+    breakerTrips: shouldTrip ? 1 : 0,
+    falsePositives: isFalsePositive ? 1 : 0,
+  };
+}
+
+export async function run7DaySim(
+  priceSeries: PriceData[],
+  lagSeconds: number = 45,
+  twapSeconds: number = 15
+): Promise<void> {
+  console.log("Starting 7-day JitoSOL depeg simulation with lag injector...");
+
+  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
+  const wallet = new anchor.Wallet(Keypair.generate());
+  const provider = new anchor.AnchorProvider(connection, wallet, {});
   anchor.setProvider(provider);
 
-  const program = anchor.workspace.Vault as anchor.Program<Vault>;
+  const testOracle = await createTestOracle(provider);
+  const lagInjector = createLagInjector(provider, testOracle.pubkey);
+  
+  const slotDuration = 0.4; // seconds per slot
+  const lagSlots = Math.floor(lagSeconds / slotDuration);
+  const twapWindow = Math.floor(twapSeconds / slotDuration);
+  
+  const totalSlots = 7 * 24 * 60 * 60 * 2.5; // ~7 days at 2.5 slots/sec
+  let breakerTrips = 0;
+  let falsePositives = 0;
+  let totalChecks = 0;
 
-  // Create test oracle
-  const oracleKeypair = Keypair.generate();
-  const testOracle = createTestOracle(oracleKeypair.publicKey);
+  console.log(`Running simulation for ${totalSlots} slots with ${lagSlots} slot lag...`);
 
-  // Deploy a simple vault for the sim (owner = provider wallet)
-  const vaultKeypair = Keypair.generate();
-  const [protectionBuffer] = PublicKey.findProgramAddressSync(
-    [Buffer.from("protection"), vaultKeypair.publicKey.toBuffer()],
-    program.programId
-  );
+  for (let slot = 0; slot < totalSlots; slot += 25) { // sample every 10s
+    const result = await runTick(
+      lagInjector,
+      testOracle,
+      slot,
+      priceSeries,
+      lagSlots,
+      twapWindow
+    );
 
-  await program.methods
-    .initialize(new anchor.BN(1000)) // example buffer size in lamports
-    .accounts({
-      vault: vaultKeypair.publicKey,
-      owner: provider.wallet.publicKey,
-      protectionBuffer,
-      systemProgram: anchor.web3.SystemProgram.programId,
-    })
-    .signers([vaultKeypair])
-    .rpc();
+    breakerTrips += result.breakerTrips;
+    falsePositives += result.falsePositives;
+    totalChecks++;
 
-  console.log("Vault initialized. Starting 7-day tick simulation...");
-
-  const injector = new LagInjector(connection, testOracle.pubkey, 45); // 45s target lag
-
-  const logs: SimulationLog[] = [];
-  let currentSlot = 0;
-  let lastPrice = 0.95; // start near depeg
-  let priceSeries: PriceData[] = [];
-
-  // Replay last three Jito depeg price series (simplified synthetic)
-  const depegSeries: number[] = [
-    0.98, 0.97, 0.96, 0.94, 0.92, 0.90, 0.89, 0.91, 0.93, 0.95,
-    0.88, 0.85, 0.82, 0.80, 0.79, 0.81, 0.84, 0.87, 0.90, 0.92,
-    0.75, 0.72, 0.70, 0.73, 0.78, 0.85, 0.88, 0.91, 0.94, 0.97,
-  ];
-
-  while (currentSlot < SIM_DURATION_SLOTS) {
-    // Advance simulated slot
-    currentSlot += 1;
-
-    // Inject price with configurable lag
-    if (currentSlot % 4 === 0) { // price tick every ~2s
-      const idx = Math.floor(currentSlot / 10) % depegSeries.length;
-      lastPrice = depegSeries[idx];
-      const priceData: PriceData = {
-        price: lastPrice,
-        confidence: 0.01,
-        timestamp: Math.floor(Date.now() / 1000),
-      };
-      priceSeries.push(priceData);
-
-      injector.setPrice(priceData);
-      await injector.injectLagPrice(provider, oracleKeypair);
-
-      // Update on-chain oracle
-      await updateTestOracle(
-        connection,
-        oracleKeypair,
-        priceData.price,
-        priceData.confidence,
-        priceData.timestamp
-      );
+    if (result.breakerShouldTrip) {
+      console.log(`Slot ${slot}: CIRCUIT BREAKER TRIPPED | TWAP: ${result.twap?.toFixed(4)} | FalsePositive: ${result.isFalsePositive}`);
+    } else if (result.isFalsePositive) {
+      console.log(`Slot ${slot}: False positive detected | TWAP: ${result.twap?.toFixed(4)}`);
     }
 
-    // Run 15s TWAP false-positive checker every 15s
-    if (currentSlot % (ORACLE_UPDATE_INTERVAL * 2) === 0 && priceSeries.length > 10) {
-      const recentPrices = priceSeries.slice(-20);
-      const twapResult = checkTWAPFalsePositive(recentPrices, 0.85, 0.05); // threshold example
-
-      const breakerTripped = twapResult.breakerShouldTrip;
-      const isFalsePositive = twapResult.isFalsePositive;
-
-      logs.push({
-        slot: currentSlot,
-        price: lastPrice,
-        twap: twapResult.twap,
-        breakerTripped,
-        isFalsePositive,
-      });
-
-      if (breakerTripped) {
-        console.log(`[SLOT ${currentSlot}] Breaker TRIPPED | TWAP=${twapResult.twap.toFixed(4)} | FP=${isFalsePositive}`);
-        if (!isFalsePositive) {
-          // In real sim this would call the on-chain drawdown circuit-breaker ix
-          await program.methods
-            .triggerDrawdown()
-            .accounts({
-              vault: vaultKeypair.publicKey,
-              owner: provider.wallet.publicKey,
-              oracle: testOracle.pubkey,
-            })
-            .rpc();
-        }
-      }
-    }
-
-    // Simulate passage of time (local validator is fast)
-    if (currentSlot % 50 === 0) {
-      console.log(`Simulated slot ${currentSlot}/${SIM_DURATION_SLOTS} ...`);
-    }
+    // Simulate time passage
+    await new Promise(resolve => setTimeout(resolve, 10));
   }
 
-  // Summary
-  const trips = logs.filter(l => l.breakerTripped).length;
-  const falsePositives = logs.filter(l => l.isFalsePositive).length;
-  console.log("\n=== 7-DAY SIMULATION COMPLETE ===");
-  console.log(`Breaker trips: ${trips}`);
+  const falsePositiveRate = totalChecks > 0 ? (falsePositives / totalChecks) * 100 : 0;
+  
+  console.log("\n=== SIMULATION COMPLETE ===");
+  console.log(`Total breaker trips: ${breakerTrips}`);
   console.log(`False positives: ${falsePositives}`);
-  console.log(`False positive rate: ${trips > 0 ? ((falsePositives / trips) * 100).toFixed(1) : 0}%`);
-
-  // Write log (could be extended to CSV)
-  console.log("Simulation logs written to memory. CI ts-check passed.");
+  console.log(`False positive rate: ${falsePositiveRate.toFixed(2)}%`);
+  console.log(`Target lag: ${lagSeconds}s (${lagSlots} slots)`);
+  console.log(`TWAP window: ${twapSeconds}s (${twapWindow} slots)`);
 }
 
-runSimulation().catch(console.error);
+async function main() {
+  // Sample Jito depeg price series (simplified for test)
+  const samplePriceSeries: PriceData[] = [
+    { price: 1.00, confidence: 0.01, timestamp: 0 },
+    { price: 0.98, confidence: 0.01, timestamp: 5 },
+    { price: 0.85, confidence: 0.02, timestamp: 10 },
+    { price: 0.72, confidence: 0.03, timestamp: 15 },
+    { price: 0.65, confidence: 0.04, timestamp: 20 },
+    { price: 0.68, confidence: 0.02, timestamp: 25 },
+    { price: 0.75, confidence: 0.01, timestamp: 30 },
+    { price: 0.92, confidence: 0.01, timestamp: 35 },
+  ];
+
+  await run7DaySim(samplePriceSeries, 45, 15);
+}
+
+if (require.main === module) {
+  main().catch(console.error);
+}
+
+export { run7DaySim, SimResult };
