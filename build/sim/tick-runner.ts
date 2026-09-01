@@ -1,182 +1,134 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program, AnchorProvider, Wallet } from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { Vault } from "../target/types/vault";
 import { createLagInjector, injectLagPrice } from "./lag-injector";
 import { checkTWAPFalsePositive } from "./twap-checker";
-import { readFileSync } from "fs";
-import { join } from "path";
+import { createPriceAccount, updatePriceAccount, PriceData } from "./oracle-utils";
+import fs from "fs";
 
-// ------------------------------------------------------------------
-// Configuration
-// ------------------------------------------------------------------
-const LAG_SLOTS = 90;                    // ~45s at 500ms/slot
-const TICK_INTERVAL_MS = 15000;          // 15s TWAP windows
-const SIM_DAYS = 7;
-const SLOTS_PER_DAY = 24 * 60 * 60 * 2;  // 2 slots per second
-const TOTAL_SLOTS = SIM_DAYS * SLOTS_PER_DAY;
+// 7-day simulation constants (in slots, ~400ms per slot)
+const SLOTS_PER_SECOND = 2.5;
+const SIM_DURATION_SLOTS = 7 * 24 * 60 * 60 * SLOTS_PER_SECOND; // ~1.5M slots
+const LAG_TARGET_SLOTS = Math.floor(45 * SLOTS_PER_SECOND); // 45s lag
+const TWAP_WINDOW_SLOTS = Math.floor(15 * SLOTS_PER_SECOND);
+const TICK_INTERVAL_SLOTS = 10; // simulate every 4s
 
-const JITO_PRICE_FEED = new PublicKey("J1toreD8z4c4oJ2z6v4z8vKkL9vL2z3x4y5z6x7v8w9"); // placeholder for sim oracle
-const VAULT_PROGRAM_ID = new PublicKey("Vau1t1111111111111111111111111111111111111");
+// Sample JitoSOL depeg price series (price in USD * 1e9, last three known depeg events simplified)
+const PRICE_SERIES: PriceData[] = [
+  { price: 0.98 * 1e9, confidence: 0.02 * 1e9, timestamp: 0 },
+  { price: 0.95 * 1e9, confidence: 0.03 * 1e9, timestamp: 5 },
+  { price: 0.92 * 1e9, confidence: 0.04 * 1e9, timestamp: 12 },
+  { price: 0.89 * 1e9, confidence: 0.05 * 1e9, timestamp: 20 },
+  { price: 0.87 * 1e9, confidence: 0.06 * 1e9, timestamp: 35 },
+  { price: 0.85 * 1e9, confidence: 0.07 * 1e9, timestamp: 60 },
+  { price: 0.90 * 1e9, confidence: 0.04 * 1e9, timestamp: 90 },
+  { price: 0.96 * 1e9, confidence: 0.02 * 1e9, timestamp: 130 },
+  { price: 0.99 * 1e9, confidence: 0.01 * 1e9, timestamp: 200 },
+];
 
-const PRICE_SERIES_PATH = join(__dirname, "jito-depeg-series.json");
-
-// ------------------------------------------------------------------
-// On-chain Vault + Buffer Accounts
-// ------------------------------------------------------------------
-let vault: PublicKey;
-let protectionBuffer: PublicKey;
-let owner: Keypair;
-
-// ------------------------------------------------------------------
-// Simulation State
-// ------------------------------------------------------------------
-let currentSlot = 0;
-let breakerTrips = 0;
-let falsePositives = 0;
-let lastPrice = 1.0;
-let priceHistory: number[] = [];
-
-// ------------------------------------------------------------------
-// Helper: load replay series (price + slot timestamps)
-// ------------------------------------------------------------------
-function loadPriceSeries(): Array<{ slot: number; price: number }> {
-  const raw = readFileSync(PRICE_SERIES_PATH, "utf-8");
-  return JSON.parse(raw) as Array<{ slot: number; price: number }>;
-}
-
-// ------------------------------------------------------------------
-// On-chain helper: initialize vault (once)
-// ------------------------------------------------------------------
-async function initializeVault(provider: AnchorProvider, program: Program<Vault>) {
-  owner = Keypair.generate();
-  const vaultKp = Keypair.generate();
-  vault = vaultKp.publicKey;
-
-  const bufferKp = Keypair.generate();
-  protectionBuffer = bufferKp.publicKey;
-
-  const tx = await program.methods
-    .initialize(0) // 0% fee for sim
-    .accounts({
-      vault: vault,
-      owner: owner.publicKey,
-      protectionBuffer: protectionBuffer,
-      systemProgram: SystemProgram.programId,
-    })
-    .signers([vaultKp, bufferKp, owner])
-    .rpc();
-
-  console.log(`Vault initialized at ${vault.toBase58()} (slot ${currentSlot})`);
-}
-
-// ------------------------------------------------------------------
-// On-chain helper: call drawdown circuit breaker
-// ------------------------------------------------------------------
-async function triggerCircuitBreaker(program: Program<Vault>, price: number) {
-  try {
-    const tx = await program.methods
-      .triggerDrawdown(new anchor.BN(Math.floor(price * 1e9))) // price in 9 decimals
-      .accounts({
-        vault: vault,
-        owner: owner.publicKey,
-        oracle: JITO_PRICE_FEED,
-        protectionBuffer: protectionBuffer,
-      })
-      .signers([owner])
-      .rpc();
-
-    console.log(`[BREAKER TRIP] slot=${currentSlot} price=${price.toFixed(4)} tx=${tx}`);
-    breakerTrips++;
-    return true;
-  } catch (err: any) {
-    console.error(`[BREAKER FAILED] ${err.message}`);
-    return false;
-  }
-}
-
-// ------------------------------------------------------------------
-// Main simulation loop
-// ------------------------------------------------------------------
-async function runSimulation() {
-  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
-  const wallet = new Wallet(Keypair.generate());
-  const provider = new AnchorProvider(connection, wallet, { commitment: "confirmed" });
+async function main() {
+  // Setup provider and program
+  const provider = AnchorProvider.env();
   anchor.setProvider(provider);
+  const program = anchor.workspace.Vault as Program<Vault>;
+  const payer = (provider.wallet as Wallet).payer;
 
-  const program = new Program<Vault>(
-    JSON.parse(readFileSync("./target/idl/vault.json", "utf-8")),
-    VAULT_PROGRAM_ID,
-    provider
+  console.log("Starting pure-onchain Anchor JitoSOL vault depeg sim...");
+
+  // Create oracle price account
+  const oracleKeypair = Keypair.generate();
+  await createPriceAccount(provider.connection, payer, oracleKeypair, program.programId);
+  const oraclePubkey = oracleKeypair.publicKey;
+
+  // Initialize vault
+  const vaultKeypair = Keypair.generate();
+  const [protectionBuffer] = PublicKey.findProgramAddressSync(
+    [Buffer.from("protection_buffer"), vaultKeypair.publicKey.toBuffer()],
+    program.programId
   );
 
-  await initializeVault(provider, program);
+  await program.methods
+    .initialize(new anchor.BN(0.85 * 1e9)) // drawdown threshold 15%
+    .accounts({
+      vault: vaultKeypair.publicKey,
+      owner: payer.publicKey,
+      oracle: oraclePubkey,
+      protectionBuffer,
+      systemProgram: SystemProgram.programId,
+    })
+    .signers([vaultKeypair])
+    .rpc();
 
-  const injector = createLagInjector(connection, JITO_PRICE_FEED, LAG_SLOTS);
-  const series = loadPriceSeries();
+  console.log(`Vault initialized: ${vaultKeypair.publicKey.toBase58()}`);
 
-  console.log(`Starting 7-day JitoSOL depeg sim (${series.length} ticks, lag=${LAG_SLOTS} slots)...\n`);
+  // Create lag injector
+  const injector = createLagInjector(PRICE_SERIES, LAG_TARGET_SLOTS);
 
-  let seriesIdx = 0;
-  let lastTickSlot = 0;
+  let currentSlot = 0;
+  let breakerTrips = 0;
+  let falsePositives = 0;
+  let lastPrices: PriceData[] = [];
 
-  while (currentSlot < TOTAL_SLOTS) {
-    // Advance to next tick
-    currentSlot = Math.min(currentSlot + Math.floor(TICK_INTERVAL_MS / 500), TOTAL_SLOTS);
+  console.log("Running 7-day tick simulation...");
 
-    // Inject lagged price from replay series
-    while (seriesIdx < series.length && series[seriesIdx].slot <= currentSlot - LAG_SLOTS) {
-      const entry = series[seriesIdx];
-      await injectLagPrice(injector, entry.price, entry.slot);
-      lastPrice = entry.price;
-      priceHistory.push(entry.price);
-      seriesIdx++;
+  while (currentSlot < SIM_DURATION_SLOTS) {
+    // Inject lagged price at current slot
+    const injected = injectLagPrice(injector, currentSlot, oraclePubkey, payer);
+    if (injected) {
+      const priceData = PRICE_SERIES[Math.floor(Math.random() * PRICE_SERIES.length)];
+      await updatePriceAccount(
+        provider.connection,
+        payer,
+        oraclePubkey,
+        priceData.price,
+        priceData.confidence,
+        currentSlot
+      );
+      lastPrices.push({ ...priceData, timestamp: currentSlot });
+      if (lastPrices.length > 50) lastPrices.shift(); // keep bounded history
     }
 
-    // Run 15s TWAP false-positive checker
-    if (priceHistory.length >= 3) {
-      const isFalsePositive = checkTWAPFalsePositive(priceHistory, 0.05); // 5% drawdown threshold
+    // Every TWAP_WINDOW_SLOTS, run false-positive checker against onchain state
+    if (currentSlot % TWAP_WINDOW_SLOTS === 0 && lastPrices.length >= 3) {
+      const isFalsePositive = checkTWAPFalsePositive(
+        lastPrices,
+        TWAP_WINDOW_SLOTS,
+        0.85 * 1e9 // drawdown threshold
+      );
       if (isFalsePositive) {
         falsePositives++;
-        console.log(`[FALSE POSITIVE] slot=${currentSlot} price=${lastPrice.toFixed(4)}`);
-      } else if (lastPrice < 0.97) { // real drawdown detected
-        const tripped = await triggerCircuitBreaker(program, lastPrice);
-        if (tripped) {
-          // pause vault after trip
-          await program.methods
-            .pause()
-            .accounts({ vault, owner: owner.publicKey })
-            .signers([owner])
-            .rpc();
-          console.log(`[VAULT PAUSED] at slot ${currentSlot}`);
-          break; // end sim on first real trip for this harness
-        }
+        console.log(`[${currentSlot}] TWAP false positive detected`);
       }
     }
 
-    // Throttle output
-    if (currentSlot - lastTickSlot >= 480) { // ~4min log cadence
-      console.log(`tick slot=${currentSlot} price=${lastPrice.toFixed(4)} trips=${breakerTrips} fp=${falsePositives}`);
-      lastTickSlot = currentSlot;
+    // Tick vault onchain (simulate drawdown circuit breaker check)
+    try {
+      await program.methods
+        .checkDrawdown()
+        .accounts({
+          vault: vaultKeypair.publicKey,
+          oracle: oraclePubkey,
+          owner: payer.publicKey,
+        })
+        .rpc();
+    } catch (err: any) {
+      if (err.toString().includes("DrawdownBreached")) {
+        breakerTrips++;
+        console.log(`[${currentSlot}] CIRCUIT BREAKER TRIPPED`);
+      }
     }
 
-    // Simulate passage of time
-    await new Promise((r) => setTimeout(r, 50)); // fast-forward sim
+    currentSlot += TICK_INTERVAL_SLOTS;
   }
 
-  // Final stats
-  console.log("\n=== SIMULATION COMPLETE ===");
-  console.log(`Total slots simulated : ${currentSlot}`);
-  console.log(`Breaker trips          : ${breakerTrips}`);
-  console.log(`False positives        : ${falsePositives}`);
-  console.log(`Final Jito price       : ${lastPrice.toFixed(4)}`);
-  console.log(`Outcome                : ${breakerTrips > 0 ? "PROTECTION TRIGGERED" : "NO BREACH"}`);
+  console.log("\n=== Simulation Complete ===");
+  console.log(`Total breaker trips: ${breakerTrips}`);
+  console.log(`False positives detected: ${falsePositives}`);
+  console.log(`False positive rate: ${((falsePositives / Math.max(breakerTrips, 1)) * 100).toFixed(1)}%`);
 }
 
-// ------------------------------------------------------------------
-// Run
-// ------------------------------------------------------------------
-runSimulation().catch((err) => {
-  console.error("Simulation crashed:", err);
+main().catch((err) => {
+  console.error(err);
   process.exit(1);
 });
