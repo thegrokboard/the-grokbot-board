@@ -1,90 +1,97 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
-import { createLagInjector, injectLagPrice, LagInjector } from "./lag-injector";
+import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
+import { Vault } from "../target/types/vault";
+import { createLagInjector, injectLagPrice } from "./lag-injector";
 import { checkTWAPFalsePositive } from "./twap-checker";
 import { createPriceAccount, updatePriceAccount, PriceData } from "./oracle-utils";
-import { Program } from "@coral-xyz/anchor";
-import { Vault } from "../target/types/vault";
 
-async function runTickSimulation() {
-  // Setup local test validator connection
-  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
-  const payer = Keypair.generate();
+const JITO_SOL_MINT = new PublicKey("J1toso1uckeCBxdeHfG1sK5Wv9z5y2v7z2z2z2z2z2"); // placeholder
+const PYTH_ORACLE_PROGRAM = new PublicKey("FsJ3A3u2vn5cTVofAjv5j7YQ4vKqN7g3jF5z5z5z5z5"); // placeholder
+const PYTH_PRICE_FEED = new PublicKey("11111111111111111111111111111111"); // placeholder for sim
 
-  // Airdrop to payer
-  const airdropSig = await connection.requestAirdrop(payer.publicKey, 10 * LAMPORTS_PER_SOL);
-  await connection.confirmTransaction(airdropSig);
-
-  const provider = new anchor.AnchorProvider(connection, new anchor.Wallet(payer), {
-    commitment: "confirmed",
-  });
+async function main() {
+  const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
+  const program = anchor.workspace.Vault as anchor.Program<Vault>;
 
-  const program = anchor.workspace.Vault as Program<Vault>;
+  const owner = provider.wallet;
+  const vault = Keypair.generate();
+  const protectionBuffer = Keypair.generate();
+  const oracleAccount = await createPriceAccount(provider.connection, owner.payer, PYTH_ORACLE_PROGRAM);
 
-  // Create oracle price account for JitoSOL
-  const oraclePubkey = await createPriceAccount(provider, payer);
-
-  // Initialize vault (minimal - assume program has initialize instruction)
+  console.log("Initializing vault...");
   await program.methods
-    .initialize(new anchor.BN(0))
+    .initialize(new anchor.BN(1000), new anchor.BN(500))
     .accounts({
-      vault: anchor.web3.Keypair.generate().publicKey,
-      owner: payer.publicKey,
-      jitoMint: new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCP"), // placeholder
-      oracle: oraclePubkey,
-      systemProgram: anchor.web3.SystemProgram.programId,
+      vault: vault.publicKey,
+      owner: owner.publicKey,
+      protectionBuffer: protectionBuffer.publicKey,
+      systemProgram: SystemProgram.programId,
     })
-    .signers([payer])
+    .signers([vault, protectionBuffer])
     .rpc();
 
-  // Create lag injector (configurable 45s target)
-  const lagInjector: LagInjector = createLagInjector(45, connection);
+  const lagInjector = createLagInjector(provider.connection, oracleAccount, 45);
 
-  // Replay last three Jito depeg price series (hard-coded sample data for sim)
+  // Replay last three Jito depeg price series (simplified historical data)
   const priceSeries: PriceData[] = [
-    { price: 0.92, confidence: 0.01, timestamp: Date.now() - 120000 },
-    { price: 0.88, confidence: 0.015, timestamp: Date.now() - 90000 },
-    { price: 0.75, confidence: 0.02, timestamp: Date.now() - 60000 },
+    { price: 0.92, confidence: 0.01, timestamp: Date.now() / 1000, slot: 100 },
+    { price: 0.85, confidence: 0.02, timestamp: Date.now() / 1000 + 5, slot: 105 },
+    { price: 0.78, confidence: 0.03, timestamp: Date.now() / 1000 + 10, slot: 110 },
   ];
 
-  // Inject lagged prices slot-exactly
+  console.log("Injecting lagged prices...");
   for (const pd of priceSeries) {
-    await injectLagPrice(lagInjector, oraclePubkey, pd.price, pd.confidence, pd.timestamp);
-    await new Promise((r) => setTimeout(r, 15000)); // 15s tick
+    await injectLagPrice(lagInjector, pd);
   }
 
-  // 15s TWAP false-positive checker
-  const isFalsePositive = checkTWAPFalsePositive(priceSeries);
-  console.log("TWAP false positive on replay:", isFalsePositive);
+  console.log("Checking 15s TWAP false-positive...");
+  const isFalsePositive = await checkTWAPFalsePositive(
+    provider.connection,
+    oracleAccount,
+    new anchor.BN(15)
+  );
+  console.log("Is false positive:", isFalsePositive);
 
-  // 7-day tick runner simulation (scaled to ~7 ticks for demo)
-  const breakerTrips = 0;
-  let falsePositives = 0;
+  // 7-day tick runner simulation (placeholder for full 7d run)
+  console.log("Starting 7-day tick simulation (dry-run mode)...");
+  for (let tick = 0; tick < 5; tick++) {  // small for CI speed
+    const currentSlot = 100 + tick * 10;
+    const currentPrice: PriceData = {
+      price: 0.9 - (tick * 0.03),
+      confidence: 0.015,
+      timestamp: Date.now() / 1000 + tick * 15,
+      slot: currentSlot,
+    };
 
-  for (let day = 0; day < 7; day++) {
-    console.log(`Sim day ${day + 1}/7`);
-    const currentPrices: PriceData[] = priceSeries.map((p, i) => ({
-      ...p,
-      timestamp: Date.now() - (60000 * (7 - day - i)),
-    }));
+    await updatePriceAccount(provider.connection, owner.payer, oracleAccount, currentPrice);
 
-    const fp = checkTWAPFalsePositive(currentPrices);
-    if (fp) falsePositives++;
+    const tripped = await program.methods
+      .checkDrawdown()
+      .accounts({
+        vault: vault.publicKey,
+        priceOracle: oracleAccount,
+      })
+      .rpc()
+      .then(() => false)
+      .catch((e) => {
+        console.log("Breaker tripped on tick", tick, e.message);
+        return true;
+      });
 
-    // Simulate drawdown circuit-breaker check
-    const currentPrice = currentPrices[currentPrices.length - 1].price;
-    if (currentPrice < 0.8) {
-      console.log("Circuit breaker would trip on drawdown");
-      // breakerTrips++; (would call program instruction)
-    }
+    const fp = await checkTWAPFalsePositive(
+      provider.connection,
+      oracleAccount,
+      new anchor.BN(15)
+    );
+
+    console.log(`Tick ${tick}: breaker=${tripped}, falsePositive=${fp}`);
   }
 
-  console.log("Simulation complete.");
-  console.log("Breaker trips:", breakerTrips);
-  console.log("False positives:", falsePositives);
-  console.log("False positive rate:", (falsePositives / 7) * 100, "%");
+  console.log("Simulation complete. Breaker trips vs false positives logged.");
 }
 
-// Run the sim
-runTickSimulation().catch(console.error);
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
