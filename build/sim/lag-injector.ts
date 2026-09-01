@@ -2,65 +2,48 @@ import * as anchor from "@coral-xyz/anchor";
 import { PublicKey, Keypair } from "@solana/web3.js";
 import { PriceData } from "./oracle-utils";
 
-export interface LagConfig {
-  lagSlots: number;
-  targetLagMs: number;
+export interface TestOracle {
+  pubkey: PublicKey;
+  setPrice: (price: number, conf: number, slot: number) => Promise<void>;
+  injectLagPrice: (price: number, slot: number) => Promise<void>;
+  getPriceHistory: () => PriceData[];
+  reset: () => void;
 }
 
-export class TestOracle {
-  private currentPrice: number = 1.0;
-  private confidence: number = 0.01;
-  private priceHistory: PriceData[] = [];
-  private slot: number = 0;
-  private lagConfig: LagConfig;
+export class LagInjector implements TestOracle {
+  pubkey: PublicKey;
+  private history: PriceData[] = [];
+  private lagSlots: number = 90; // ~45s at 500ms/slot target
 
-  constructor(lagConfig: LagConfig = { lagSlots: 90, targetLagMs: 45000 }) {
-    this.lagConfig = lagConfig;
+  constructor() {
+    this.pubkey = Keypair.generate().publicKey;
   }
 
-  public setPrice(price: number, conf: number = 0.01): void {
-    this.currentPrice = price;
-    this.confidence = conf;
-    this.slot += 1;
-    this.priceHistory.push({
-      price: this.currentPrice,
-      conf: this.confidence,
-      slot: this.slot,
+  async setPrice(price: number, conf: number, slot: number): Promise<void> {
+    this.history.push({
+      price: Math.floor(price * 1_000_000),
+      confidence: Math.floor(conf * 1_000_000),
+      timestamp: Date.now(),
     });
   }
 
-  public injectLagPrice(price: number, conf: number = 0.01): void {
-    this.slot += 1;
-    this.priceHistory.push({
-      price,
-      conf,
-      slot: this.slot - this.lagConfig.lagSlots,
+  async injectLagPrice(price: number, slot: number): Promise<void> {
+    const laggedSlot = slot - this.lagSlots;
+    this.history.push({
+      price: Math.floor(price * 1_000_000),
+      confidence: Math.floor(0.02 * 1_000_000),
+      timestamp: Date.now(),
     });
-    this.currentPrice = price;
-    this.confidence = conf;
   }
 
-  public getPriceHistory(): PriceData[] {
-    return [...this.priceHistory];
+  getPriceHistory(): PriceData[] {
+    return [...this.history];
   }
 
-  public getCurrentPrice(): number {
-    return this.currentPrice;
-  }
-
-  public getCurrentConfidence(): number {
-    return this.confidence;
-  }
-
-  public getCurrentSlot(): number {
-    return this.slot;
-  }
-
-  public advanceSlot(slots: number = 1): void {
-    this.slot += slots;
+  reset(): void {
+    this.history = [];
   }
 }
 
-export function createLagInjector(lagSlots: number = 90): TestOracle {
-  return new TestOracle({ lagSlots, targetLagMs: 45000 });
-}
+export { LagInjector as default };
+export type { PriceData };
