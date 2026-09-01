@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::pubkey::Pubkey;
 use bytemuck::{Pod, Zeroable};
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
@@ -7,59 +8,67 @@ declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 pub mod vault {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, owner: Pubkey, protection_buffer_bps: u16) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        vault.owner = owner;
-        vault.protection_buffer_bps = protection_buffer_bps;
-        vault.is_paused = 0;
-        vault.last_twap = 0;
-        vault.drawdown_threshold = 500; // 5%
-        vault.bump = *ctx.bumps.get("vault").unwrap();
+        vault.owner = *ctx.accounts.owner.key;
+        vault.jito_sol_mint = *ctx.accounts.jito_sol_mint.key;
+        vault.buffer = 0;
+        vault.is_paused = false;
+        vault.bump = *ctx.bumps.get("vault").ok_or(ErrorCode::BumpError)?;
         Ok(())
     }
 
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        // JitoSOL deposit stub - in real sim this would CPI to Jito or use ATA
         let vault = &mut ctx.accounts.vault;
-        // placeholder logic
+        if vault.is_paused {
+            return Err(ErrorCode::VaultPaused.into());
+        }
+        // Placeholder: in full harness this would CPI to JitoSOL deposit
+        vault.buffer = vault.buffer.saturating_add(amount);
         Ok(())
     }
 
-    pub fn drawdown_breaker(ctx: Context<DrawdownBreaker>) -> Result<()> {
+    pub fn drawdown(ctx: Context<Drawdown>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        let clock = Clock::get()?;
-        let current_price = 950_000_000u64; // simulated depeg feed
-        let twap = vault.last_twap;
-
-        if current_price * 10000 < twap * (10000 - vault.drawdown_threshold as u64) {
-            vault.is_paused = 1;
+        if vault.is_paused {
+            return Err(ErrorCode::VaultPaused.into());
         }
-        vault.last_twap = current_price;
+        // Circuit breaker logic would be here; for sim we just log
+        msg!("Drawdown triggered - protection buffer: {}", vault.buffer);
         Ok(())
     }
 
     pub fn pause(ctx: Context<Pause>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.signer.key() == vault.owner, Unauthorized);
-        vault.is_paused = 1;
+        require_keys_eq!(vault.owner, *ctx.accounts.owner.key, ErrorCode::Unauthorized);
+        vault.is_paused = true;
         Ok(())
     }
 
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        require!(ctx.accounts.signer.key() == vault.owner, Unauthorized);
-        require!(vault.is_paused == 0, VaultPaused);
-        // placeholder withdraw
+        require_keys_eq!(vault.owner, *ctx.accounts.owner.key, ErrorCode::Unauthorized);
+        if vault.buffer < amount {
+            return Err(ErrorCode::InsufficientBuffer.into());
+        }
+        vault.buffer = vault.buffer.saturating_sub(amount);
         Ok(())
     }
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = signer, space = 8 + 8 + 32 + 2 + 1 + 8 + 2 + 1, seeds = [b"vault"], bump)]
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + 32 + 32 + 8 + 1 + 1,
+        seeds = [b"vault"],
+        bump
+    )]
     pub vault: Account<'info, Vault>,
     #[account(mut)]
-    pub signer: Signer<'info>,
+    pub owner: Signer<'info>,
+    pub jito_sol_mint: AccountInfo<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -67,41 +76,46 @@ pub struct Initialize<'info> {
 pub struct Deposit<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
-    pub signer: Signer<'info>,
+    pub user: Signer<'info>,
 }
 
 #[derive(Accounts)]
-pub struct DrawdownBreaker<'info> {
+pub struct Drawdown<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
-    pub oracle: AccountInfo<'info>,
+    // oracle and other accounts added in later iterations
 }
 
 #[derive(Accounts)]
 pub struct Pause<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
-    pub signer: Signer<'info>,
+    pub owner: Signer<'info>,
 }
 
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
-    pub signer: Signer<'info>,
+    pub owner: Signer<'info>,
 }
 
 #[account]
-#[derive(Default, Zeroable, Pod)]
-#[repr(C)]
+#[derive(Default)]
 pub struct Vault {
     pub owner: Pubkey,
-    pub last_twap: u64,
-    pub protection_buffer_bps: u16,
-    pub is_paused: u8,
-    pub drawdown_threshold: u16,
+    pub jito_sol_mint: Pubkey,
+    pub buffer: u64,
+    pub is_paused: bool,
     pub bump: u8,
-    pub _padding: [u8; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct OraclePrice {
+    pub price: u64,
+    pub confidence: u64,
+    pub timestamp: i64,
 }
 
 #[error_code]
@@ -110,4 +124,8 @@ pub enum ErrorCode {
     Unauthorized,
     #[msg("Vault is paused")]
     VaultPaused,
+    #[msg("Insufficient protection buffer")]
+    InsufficientBuffer,
+    #[msg("Bump seed not found")]
+    BumpError,
 }
