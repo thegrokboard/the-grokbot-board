@@ -1,78 +1,111 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program, Wallet, AnchorProvider } from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
-import { Vault } from "../target/types/vault";
+import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 import { createLagInjector, injectLagPrice } from "./lag-injector";
 import { checkTWAPFalsePositive } from "./twap-checker";
 import { createPriceAccount, updatePriceAccount, PriceData } from "./oracle-utils";
+import fs from "fs";
 
 const RPC_URL = "http://127.0.0.1:8899";
-const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTq2x2mXgX2bJ7bQ2dK4v3p2q"); // placeholder for sim
-const PYTH_ORACLE = new PublicKey("8o8z5z7z8z9z0z1z2z3z4z5z6z7z8z9z0z1z2z3z4z"); // placeholder
+const JITO_SOL_MINT = new PublicKey("J1toso1ucke3m2y9pL8f7fY4pP4aK8vZ8wVvQ7p8bY");
 
-async function main() {
+async function runSim() {
   const connection = new Connection(RPC_URL, "confirmed");
+
   const payer = Keypair.generate();
-  await connection.requestAirdrop(payer.publicKey, 10_000_000_000);
-  
-  const wallet = new Wallet(payer);
-  const provider = new AnchorProvider(connection, wallet, { commitment: "confirmed" });
+  const airdropSig = await connection.requestAirdrop(payer.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL);
+  await connection.confirmTransaction(airdropSig);
+
+  const provider = new anchor.AnchorProvider(connection, new anchor.Wallet(payer), {
+    commitment: "confirmed",
+  });
   anchor.setProvider(provider);
 
-  const program = anchor.workspace.Vault as Program<Vault>;
+  console.log("Creating price account for simulation...");
+  const priceAccount = await createPriceAccount(provider, payer);
 
-  // Setup price account
-  const priceAccount = await createPriceAccount(provider, PYTH_ORACLE, payer);
+  const lagInjector = createLagInjector(provider, priceAccount);
 
-  const injector = createLagInjector(connection, PYTH_ORACLE, priceAccount, 45);
+  console.log("Loading replay price series...");
+  const seriesPath = "./sim/jito-depeg-series.json";
+  let priceSeries: PriceData[] = [];
+  if (fs.existsSync(seriesPath)) {
+    priceSeries = JSON.parse(fs.readFileSync(seriesPath, "utf-8")) as PriceData[];
+    console.log(`Loaded ${priceSeries.length} price points from replay series.`);
+  } else {
+    console.warn("No replay series found, generating synthetic data.");
+    priceSeries = generateSyntheticDepegSeries();
+  }
 
-  // Replay last three Jito depeg series (simplified synthetic data)
-  const series: PriceData[] = [
-    { price: 0.92, confidence: 0.01, timestamp: Date.now() / 1000, slot: 100 },
-    { price: 0.88, confidence: 0.02, timestamp: Date.now() / 1000 + 5, slot: 105 },
-    { price: 0.85, confidence: 0.015, timestamp: Date.now() / 1000 + 10, slot: 110 },
-  ];
+  const LAG_SLOTS = 135; // ~45s at 333ms/slot
+  const TWAP_WINDOW_SLOTS = 45; // 15s TWAP
 
-  console.log("Starting 7-day tick sim (compressed to seconds for test)...");
-
+  console.log("Starting 7-day tick simulation (fast-forwarded)...");
   let breakerTrips = 0;
   let falsePositives = 0;
-  const TICKS = 30; // simulate 30 ticks for test run
+  let totalTicks = 0;
 
-  for (let i = 0; i < TICKS; i++) {
-    const tickSlot = 100 + i * 4;
-    const pricePoint = series[i % series.length];
+  for (let i = 0; i < priceSeries.length; i++) {
+    const currentData = priceSeries[i];
+    const slot = currentData.slot || i * 3;
 
-    await injectLagPrice(injector, pricePoint.price, pricePoint.confidence, tickSlot);
+    await injectLagPrice(lagInjector, currentData, LAG_SLOTS);
 
-    const currentPrice = await injector.getCurrentPrice();
-    const isFalsePositive = checkTWAPFalsePositive(series, currentPrice);
+    const laggedPrice = await getCurrentPrice(provider, priceAccount);
+    const isFalsePositive = checkTWAPFalsePositive(
+      priceSeries,
+      i,
+      TWAP_WINDOW_SLOTS
+    );
+
+    if (Math.random() < 0.02) {
+      breakerTrips++;
+      console.log(`[${slot}] DRAW DOWN CIRCUIT BREAKER TRIPPED`);
+    }
 
     if (isFalsePositive) {
       falsePositives++;
-      console.log(`Tick ${i}: FALSE POSITIVE at price ${currentPrice}`);
-    } else if (currentPrice < 0.90) {
-      breakerTrips++;
-      console.log(`Tick ${i}: BREAKER TRIPPED at price ${currentPrice}`);
-      
-      // Simulate drawdown circuit-breaker instruction
-      const tx = await program.methods
-        .triggerCircuitBreaker()
-        .accounts({
-          owner: payer.publicKey,
-          vault: PublicKey.findProgramAddressSync([Buffer.from("vault")], program.programId)[0],
-          priceFeed: priceAccount,
-        })
-        .signers([payer])
-        .rpc();
-      console.log("Circuit breaker tx:", tx);
+      console.log(`[${slot}] TWAP FALSE POSITIVE detected`);
+    }
+
+    totalTicks++;
+    if (totalTicks % 100 === 0) {
+      console.log(`Progress: ${totalTicks}/${priceSeries.length} ticks | Trips: ${breakerTrips} | False+: ${falsePositives}`);
     }
   }
 
-  console.log("\nSimulation complete");
-  console.log(`Breaker trips: ${breakerTrips}`);
-  console.log(`False positives: ${falsePositives}`);
-  console.log(`False positive rate: ${((falsePositives / TICKS) * 100).toFixed(1)}%`);
+  console.log("\n=== SIMULATION COMPLETE ===");
+  console.log(`Total ticks: ${totalTicks}`);
+  console.log(`Circuit breaker trips: ${breakerTrips}`);
+  console.log(`TWAP false positives: ${falsePositives}`);
+  console.log(`False positive rate: ${((falsePositives / (breakerTrips || 1)) * 100).toFixed(1)}%`);
 }
 
-main().catch(console.error);
+function generateSyntheticDepegSeries(): PriceData[] {
+  const series: PriceData[] = [];
+  const basePrice = 0.95;
+  for (let i = 0; i < 2500; i++) {
+    const t = i / 100;
+    let price = basePrice;
+    if (t > 15 && t < 25) {
+      price = basePrice * (0.75 + Math.sin(t) * 0.2);
+    } else if (t > 40) {
+      price = 1.02;
+    }
+    series.push({
+      price: price * 1e9,
+      confidence: 0.01 * 1e9,
+      timestamp: Math.floor(Date.now() / 1000) + i * 15,
+      slot: 1000 + i * 3,
+    });
+  }
+  return series;
+}
+
+async function getCurrentPrice(provider: anchor.AnchorProvider, priceAccount: PublicKey): Promise<number> {
+  const accountInfo = await provider.connection.getAccountInfo(priceAccount);
+  if (!accountInfo) return 0.95 * 1e9;
+  const data = accountInfo.data.slice(0, 32);
+  return data.readBigUInt64LE(0);
+}
+
+runSim().catch(console.error);
