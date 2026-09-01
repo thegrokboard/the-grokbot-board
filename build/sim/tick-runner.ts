@@ -1,75 +1,78 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { Program, Wallet, AnchorProvider } from "@coral-xyz/anchor";
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
+import { Vault } from "../target/types/vault";
 import { createLagInjector, injectLagPrice } from "./lag-injector";
 import { checkTWAPFalsePositive } from "./twap-checker";
 import { createPriceAccount, updatePriceAccount, PriceData } from "./oracle-utils";
 
-const CLUSTER_URL = "http://127.0.0.1:8899";
-const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn");
-const ORACLE_PROGRAM_ID = new PublicKey("7r8vPq3t8vPq3t8vPq3t8vPq3t8vPq3t8vPq3t8vPq3"); // placeholder for sim
-const PYTH_ORACLE_FEED = new PublicKey("H6ARHf6YXhGYeQfUzQNGk6qGfC5zH4u4m3g9zQf5z4z");
+const RPC_URL = "http://127.0.0.1:8899";
+const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTq2x2mXgX2bJ7bQ2dK4v3p2q"); // placeholder for sim
+const PYTH_ORACLE = new PublicKey("8o8z5z7z8z9z0z1z2z3z4z5z6z7z8z9z0z1z2z3z4z"); // placeholder
 
 async function main() {
-  const connection = new Connection(CLUSTER_URL, "confirmed");
-  const wallet = Keypair.generate();
-  const provider = new anchor.AnchorProvider(connection, new anchor.Wallet(wallet), {});
+  const connection = new Connection(RPC_URL, "confirmed");
+  const payer = Keypair.generate();
+  await connection.requestAirdrop(payer.publicKey, 10_000_000_000);
+  
+  const wallet = new Wallet(payer);
+  const provider = new AnchorProvider(connection, wallet, { commitment: "confirmed" });
   anchor.setProvider(provider);
 
+  const program = anchor.workspace.Vault as Program<Vault>;
+
   // Setup price account
-  const priceAccount = await createPriceAccount(connection, wallet, PYTH_ORACLE_FEED);
+  const priceAccount = await createPriceAccount(provider, PYTH_ORACLE, payer);
 
-  // Create lag injector
-  const injector = createLagInjector(connection, wallet, priceAccount, 45);
+  const injector = createLagInjector(connection, PYTH_ORACLE, priceAccount, 45);
 
-  // Replay series (last three Jito depeg points - simplified for sim)
-  const priceSeries: PriceData[] = [
-    { price: 0.92, confidence: 0.01, timestamp: Date.now() / 1000 - 90 },
-    { price: 0.85, confidence: 0.02, timestamp: Date.now() / 1000 - 60 },
-    { price: 0.78, confidence: 0.015, timestamp: Date.now() / 1000 - 30 },
+  // Replay last three Jito depeg series (simplified synthetic data)
+  const series: PriceData[] = [
+    { price: 0.92, confidence: 0.01, timestamp: Date.now() / 1000, slot: 100 },
+    { price: 0.88, confidence: 0.02, timestamp: Date.now() / 1000 + 5, slot: 105 },
+    { price: 0.85, confidence: 0.015, timestamp: Date.now() / 1000 + 10, slot: 110 },
   ];
 
-  console.log("Starting pure-onchain Anchor JitoSOL depeg sim...");
+  console.log("Starting 7-day tick sim (compressed to seconds for test)...");
 
   let breakerTrips = 0;
   let falsePositives = 0;
-  const TICK_INTERVAL_MS = 15000; // 15s TWAP check
+  const TICKS = 30; // simulate 30 ticks for test run
 
-  // 7-day sim runner (simulated with 20 ticks for test harness)
-  for (let tick = 0; tick < 20; tick++) {
-    const currentTime = Date.now();
-    const lagPrice = injectLagPrice(injector, priceSeries, currentTime);
+  for (let i = 0; i < TICKS; i++) {
+    const tickSlot = 100 + i * 4;
+    const pricePoint = series[i % series.length];
 
-    // Update on-chain oracle with lagged price
-    await updatePriceAccount(connection, wallet, priceAccount, lagPrice.price, lagPrice.confidence);
+    await injectLagPrice(injector, pricePoint.price, pricePoint.confidence, tickSlot);
 
-    // Run 15s TWAP false-positive checker - exactly 3 args per twap-checker.ts
-    const isFalsePositive = checkTWAPFalsePositive(
-      priceSeries,
-      lagPrice,
-      TICK_INTERVAL_MS
-    );
+    const currentPrice = await injector.getCurrentPrice();
+    const isFalsePositive = checkTWAPFalsePositive(series, currentPrice);
 
     if (isFalsePositive) {
       falsePositives++;
-      console.log(`Tick ${tick}: TWAP false positive detected (price=${lagPrice.price})`);
-    } else if (lagPrice.price < 0.80) {
+      console.log(`Tick ${i}: FALSE POSITIVE at price ${currentPrice}`);
+    } else if (currentPrice < 0.90) {
       breakerTrips++;
-      console.log(`Tick ${tick}: DRAW DOWN CIRCUIT BREAKER TRIPPED (price=${lagPrice.price})`);
-    } else {
-      console.log(`Tick ${tick}: normal operation (price=${lagPrice.price.toFixed(3)})`);
+      console.log(`Tick ${i}: BREAKER TRIPPED at price ${currentPrice}`);
+      
+      // Simulate drawdown circuit-breaker instruction
+      const tx = await program.methods
+        .triggerCircuitBreaker()
+        .accounts({
+          owner: payer.publicKey,
+          vault: PublicKey.findProgramAddressSync([Buffer.from("vault")], program.programId)[0],
+          priceFeed: priceAccount,
+        })
+        .signers([payer])
+        .rpc();
+      console.log("Circuit breaker tx:", tx);
     }
-
-    // Simulate time passage
-    await new Promise(resolve => setTimeout(resolve, 100));
   }
 
-  console.log("\n=== SIMULATION COMPLETE ===");
+  console.log("\nSimulation complete");
   console.log(`Breaker trips: ${breakerTrips}`);
   console.log(`False positives: ${falsePositives}`);
-  console.log("Pure-onchain Anchor vault sim harness finished.");
+  console.log(`False positive rate: ${((falsePositives / TICKS) * 100).toFixed(1)}%`);
 }
 
-main().catch(err => {
-  console.error("Sim failed:", err);
-  process.exit(1);
-});
+main().catch(console.error);
