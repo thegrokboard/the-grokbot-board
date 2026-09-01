@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Mint};
 use bytemuck::{Pod, Zeroable};
 
-declare_id!("Vau1tX2f6vC7k8eL9mN0pQ2rS4tU6vW8xY0zA2bC4dE6");
+declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
 #[program]
 pub mod vault {
