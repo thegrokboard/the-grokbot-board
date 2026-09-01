@@ -1,94 +1,102 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
-import { Vault } from "../target/types/vault";
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { createLagInjector, injectLagPrice } from "./lag-injector";
 import { checkTWAPFalsePositive } from "./twap-checker";
 import { createPriceAccount, updatePriceAccount, PriceData } from "./oracle-utils";
-
-const JITO_SOL_MINT = new PublicKey("J1toso1uckeCBxdeHfG1sK5Wv9z5y2v7z2z2z2z2z2"); // placeholder
-const PYTH_ORACLE_PROGRAM = new PublicKey("FsJ3A3u2vn5cTVofAjv5j7YQ4vKqN7g3jF5z5z5z5z5"); // placeholder
-const PYTH_PRICE_FEED = new PublicKey("11111111111111111111111111111111"); // placeholder for sim
+import { Vault } from "../target/types/vault";
 
 async function main() {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
+
   const program = anchor.workspace.Vault as anchor.Program<Vault>;
+  const connection = provider.connection;
+  const payer = (provider.wallet as anchor.Wallet).payer;
 
-  const owner = provider.wallet;
-  const vault = Keypair.generate();
+  const oracleKeypair = Keypair.generate();
+  const vaultKeypair = Keypair.generate();
+  const jitoSolMint = new PublicKey("J1toso1uCk3RLmP4n7Y5mL7o1K9z7z4r5v6n7m8o9p0"); // placeholder for JitoSOL mint
   const protectionBuffer = Keypair.generate();
-  const oracleAccount = await createPriceAccount(provider.connection, owner.payer, PYTH_ORACLE_PROGRAM);
 
-  console.log("Initializing vault...");
+  // Create price account (oracle)
+  await createPriceAccount(connection, payer, oracleKeypair);
+
+  // Initialize vault (simplified for test harness)
   await program.methods
-    .initialize(new anchor.BN(1000), new anchor.BN(500))
+    .initialize(new anchor.BN(1000)) // example buffer size in lamports
     .accounts({
-      vault: vault.publicKey,
-      owner: owner.publicKey,
+      vault: vaultKeypair.publicKey,
+      owner: payer.publicKey,
+      jitoSolMint: jitoSolMint,
       protectionBuffer: protectionBuffer.publicKey,
+      oracle: oracleKeypair.publicKey,
       systemProgram: SystemProgram.programId,
     })
-    .signers([vault, protectionBuffer])
+    .signers([vaultKeypair, protectionBuffer])
     .rpc();
 
-  const lagInjector = createLagInjector(provider.connection, oracleAccount, 45);
-
-  // Replay last three Jito depeg price series (simplified historical data)
-  const priceSeries: PriceData[] = [
-    { price: 0.92, confidence: 0.01, timestamp: Date.now() / 1000, slot: 100 },
-    { price: 0.85, confidence: 0.02, timestamp: Date.now() / 1000 + 5, slot: 105 },
-    { price: 0.78, confidence: 0.03, timestamp: Date.now() / 1000 + 10, slot: 110 },
+  // Load historical price series (last three Jito depeg events - stub data for sim)
+  const priceHistory: PriceData[] = [
+    { price: 0.95, confidence: 0.01, timestamp: Date.now() - 100000, slot: 100 },
+    { price: 0.92, confidence: 0.02, timestamp: Date.now() - 90000, slot: 150 },
+    { price: 0.88, confidence: 0.03, timestamp: Date.now() - 80000, slot: 200 },
+    { price: 0.85, confidence: 0.05, timestamp: Date.now() - 70000, slot: 250 },
+    { price: 0.90, confidence: 0.02, timestamp: Date.now() - 60000, slot: 300 },
   ];
 
-  console.log("Injecting lagged prices...");
-  for (const pd of priceSeries) {
-    await injectLagPrice(lagInjector, pd);
-  }
+  const lagInjector = createLagInjector(45); // target 45s lag
 
-  console.log("Checking 15s TWAP false-positive...");
-  const isFalsePositive = await checkTWAPFalsePositive(
-    provider.connection,
-    oracleAccount,
-    new anchor.BN(15)
-  );
-  console.log("Is false positive:", isFalsePositive);
+  console.log("Starting 7-day tick simulation (replayed over ~15s for testing)...");
 
-  // 7-day tick runner simulation (placeholder for full 7d run)
-  console.log("Starting 7-day tick simulation (dry-run mode)...");
-  for (let tick = 0; tick < 5; tick++) {  // small for CI speed
-    const currentSlot = 100 + tick * 10;
-    const currentPrice: PriceData = {
-      price: 0.9 - (tick * 0.03),
-      confidence: 0.015,
-      timestamp: Date.now() / 1000 + tick * 15,
-      slot: currentSlot,
-    };
+  let breakerTrips = 0;
+  let falsePositives = 0;
+  let tick = 0;
+  const maxTicks = 50; // simulate ~7 days compressed into ticks
 
-    await updatePriceAccount(provider.connection, owner.payer, oracleAccount, currentPrice);
-
-    const tripped = await program.methods
-      .checkDrawdown()
-      .accounts({
-        vault: vault.publicKey,
-        priceOracle: oracleAccount,
-      })
-      .rpc()
-      .then(() => false)
-      .catch((e) => {
-        console.log("Breaker tripped on tick", tick, e.message);
-        return true;
-      });
-
-    const fp = await checkTWAPFalsePositive(
-      provider.connection,
-      oracleAccount,
-      new anchor.BN(15)
+  while (tick < maxTicks) {
+    // Inject lagged price
+    const currentData = priceHistory[tick % priceHistory.length];
+    await injectLagPrice(
+      connection,
+      oracleKeypair.publicKey,
+      payer,
+      currentData.price,
+      currentData.confidence,
+      lagInjector
     );
 
-    console.log(`Tick ${tick}: breaker=${tripped}, falsePositive=${fp}`);
+    // Run 15s TWAP false-positive checker
+    const isFalsePositive = checkTWAPFalsePositive(priceHistory.slice(0, tick + 1));
+    if (isFalsePositive) {
+      falsePositives++;
+    }
+
+    // Check for drawdown circuit breaker (simplified on-chain call)
+    try {
+      await program.methods
+        .checkDrawdown()
+        .accounts({
+          vault: vaultKeypair.publicKey,
+          oracle: oracleKeypair.publicKey,
+          owner: payer.publicKey,
+        })
+        .rpc();
+    } catch (e: any) {
+      if (e.toString().includes("DrawdownBreached")) {
+        breakerTrips++;
+        console.log(`Circuit breaker tripped at tick ${tick}`);
+      }
+    }
+
+    tick++;
+    // Simulate time passage
+    await new Promise((resolve) => setTimeout(resolve, 300)); // ~15s compressed sim
   }
 
-  console.log("Simulation complete. Breaker trips vs false positives logged.");
+  console.log("Simulation complete.");
+  console.log(`Breaker trips: ${breakerTrips}`);
+  console.log(`False positives: ${falsePositives}`);
+  console.log("Ratio of false positives to trips:", falsePositives / (breakerTrips || 1));
 }
 
 main().catch((err) => {
