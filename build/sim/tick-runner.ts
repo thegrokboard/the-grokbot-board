@@ -1,111 +1,130 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
+import { Program, AnchorProvider, Wallet } from "@coral-xyz/anchor";
+import { Connection, Keypair, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { createLagInjector, injectLagPrice } from "./lag-injector";
 import { checkTWAPFalsePositive } from "./twap-checker";
 import { createPriceAccount, updatePriceAccount, PriceData } from "./oracle-utils";
-import fs from "fs";
+import { Vault } from "../target/types/vault";
 
-const RPC_URL = "http://127.0.0.1:8899";
-const JITO_SOL_MINT = new PublicKey("J1toso1ucke3m2y9pL8f7fY4pP4aK8vZ8wVvQ7p8bY");
-
-async function runSim() {
-  const connection = new Connection(RPC_URL, "confirmed");
-
+async function main() {
+  // Setup provider
+  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
   const payer = Keypair.generate();
-  const airdropSig = await connection.requestAirdrop(payer.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL);
-  await connection.confirmTransaction(airdropSig);
-
-  const provider = new anchor.AnchorProvider(connection, new anchor.Wallet(payer), {
-    commitment: "confirmed",
-  });
+  const wallet = new Wallet(payer);
+  const provider = new AnchorProvider(connection, wallet, { commitment: "confirmed" });
   anchor.setProvider(provider);
 
-  console.log("Creating price account for simulation...");
-  const priceAccount = await createPriceAccount(provider, payer);
+  // Airdrop
+  await connection.requestAirdrop(payer.publicKey, 10 * LAMPORTS_PER_SOL);
 
-  const lagInjector = createLagInjector(provider, priceAccount);
+  // Load program
+  const program = anchor.workspace.Vault as Program<Vault>;
 
-  console.log("Loading replay price series...");
-  const seriesPath = "./sim/jito-depeg-series.json";
-  let priceSeries: PriceData[] = [];
-  if (fs.existsSync(seriesPath)) {
-    priceSeries = JSON.parse(fs.readFileSync(seriesPath, "utf-8")) as PriceData[];
-    console.log(`Loaded ${priceSeries.length} price points from replay series.`);
-  } else {
-    console.warn("No replay series found, generating synthetic data.");
-    priceSeries = generateSyntheticDepegSeries();
-  }
+  // Oracle setup
+  const oracleKeypair = Keypair.generate();
+  const oraclePubkey = await createPriceAccount(provider, oracleKeypair);
 
-  const LAG_SLOTS = 135; // ~45s at 333ms/slot
-  const TWAP_WINDOW_SLOTS = 45; // 15s TWAP
+  // Initial price ~1.0 (jitoSOL)
+  await updatePriceAccount(provider, oraclePubkey, 1_000_000_000, 10_000_000); // price, confidence
 
-  console.log("Starting 7-day tick simulation (fast-forwarded)...");
+  // Lag injector (target 45s lag, replay last 3 depeg series)
+  const injector = createLagInjector(oraclePubkey, 45, 3);
+
+  // Protection buffer and vault accounts
+  const bufferKeypair = Keypair.generate();
+  const [vaultPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault"), payer.publicKey.toBuffer()],
+    program.programId
+  );
+
+  // Initialize vault (owner = payer)
+  await program.methods
+    .initialize()
+    .accounts({
+      vault: vaultPda,
+      owner: payer.publicKey,
+      buffer: bufferKeypair.publicKey,
+      oracle: oraclePubkey,
+      systemProgram: anchor.web3.SystemProgram.programId,
+    })
+    .signers([bufferKeypair])
+    .rpc();
+
+  // 7-day sim at ~15s ticks (but we drive manually here)
+  const TICKS = 7 * 24 * 60 * 4; // ~15s intervals
   let breakerTrips = 0;
   let falsePositives = 0;
-  let totalTicks = 0;
+  let currentSlot = 0;
 
-  for (let i = 0; i < priceSeries.length; i++) {
-    const currentData = priceSeries[i];
-    const slot = currentData.slot || i * 3;
+  console.log("Starting 7-day onchain JitoSOL depeg sim...");
 
-    await injectLagPrice(lagInjector, currentData, LAG_SLOTS);
+  for (let i = 0; i < TICKS; i++) {
+    currentSlot += 4; // ~15s per tick at 0.4s/slot
 
-    const laggedPrice = await getCurrentPrice(provider, priceAccount);
-    const isFalsePositive = checkTWAPFalsePositive(
-      priceSeries,
-      i,
-      TWAP_WINDOW_SLOTS
+    // Inject lagged price from replay series
+    const priceData: PriceData = await injectLagPrice(provider, injector, currentSlot);
+
+    // Update on-chain oracle
+    await updatePriceAccount(
+      provider,
+      oraclePubkey,
+      priceData.price,
+      priceData.confidence
     );
 
-    if (Math.random() < 0.02) {
+    // Run drawdown circuit-breaker check via program (logs trip)
+    try {
+      await program.methods
+        .checkDrawdown()
+        .accounts({
+          vault: vaultPda,
+          oracle: oraclePubkey,
+          buffer: bufferKeypair.publicKey,
+        })
+        .rpc();
+    } catch (e) {
+      // breaker tripped
       breakerTrips++;
-      console.log(`[${slot}] DRAW DOWN CIRCUIT BREAKER TRIPPED`);
+      console.log(`Breaker tripped at tick ${i} (slot ~${currentSlot})`);
     }
+
+    // Off-chain 15s TWAP false-positive checker (uses last 3 prices)
+    const isFalsePositive = checkTWAPFalsePositive(
+      priceData,
+      0.05, // 5% drawdown threshold
+      15    // 15s window
+    );
 
     if (isFalsePositive) {
       falsePositives++;
-      console.log(`[${slot}] TWAP FALSE POSITIVE detected`);
+      console.log(`False positive TWAP at tick ${i}`);
     }
 
-    totalTicks++;
-    if (totalTicks % 100 === 0) {
-      console.log(`Progress: ${totalTicks}/${priceSeries.length} ticks | Trips: ${breakerTrips} | False+: ${falsePositives}`);
+    // Occasional owner pause/withdraw test
+    if (i % 100 === 0 && i > 0) {
+      try {
+        await program.methods
+          .pauseAndWithdraw()
+          .accounts({
+            vault: vaultPda,
+            owner: payer.publicKey,
+            buffer: bufferKeypair.publicKey,
+          })
+          .rpc();
+      } catch (_) {}
     }
+
+    // Sleep to simulate real-time
+    await new Promise((r) => setTimeout(r, 50));
   }
 
-  console.log("\n=== SIMULATION COMPLETE ===");
-  console.log(`Total ticks: ${totalTicks}`);
-  console.log(`Circuit breaker trips: ${breakerTrips}`);
-  console.log(`TWAP false positives: ${falsePositives}`);
+  console.log("\n=== Simulation Complete ===");
+  console.log(`Breaker trips: ${breakerTrips}`);
+  console.log(`False positives: ${falsePositives}`);
   console.log(`False positive rate: ${((falsePositives / (breakerTrips || 1)) * 100).toFixed(1)}%`);
 }
 
-function generateSyntheticDepegSeries(): PriceData[] {
-  const series: PriceData[] = [];
-  const basePrice = 0.95;
-  for (let i = 0; i < 2500; i++) {
-    const t = i / 100;
-    let price = basePrice;
-    if (t > 15 && t < 25) {
-      price = basePrice * (0.75 + Math.sin(t) * 0.2);
-    } else if (t > 40) {
-      price = 1.02;
-    }
-    series.push({
-      price: price * 1e9,
-      confidence: 0.01 * 1e9,
-      timestamp: Math.floor(Date.now() / 1000) + i * 15,
-      slot: 1000 + i * 3,
-    });
-  }
-  return series;
-}
-
-async function getCurrentPrice(provider: anchor.AnchorProvider, priceAccount: PublicKey): Promise<number> {
-  const accountInfo = await provider.connection.getAccountInfo(priceAccount);
-  if (!accountInfo) return 0.95 * 1e9;
-  const data = accountInfo.data.slice(0, 32);
-  return data.readBigUInt64LE(0);
-}
-
-runSim().catch(console.error);
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
