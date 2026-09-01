@@ -1,72 +1,66 @@
 import * as anchor from "@coral-xyz/anchor";
 import { PublicKey, Keypair } from "@solana/web3.js";
-import { TestOracle } from "./oracle-utils";
+import { PriceData } from "./oracle-utils";
 
-export interface PriceData {
-  price: number;
-  confidence: number;
-  timestamp: number;
+export interface LagConfig {
+  lagSlots: number;
+  targetLagMs: number;
 }
 
-export class LagInjector {
-  private oracle: TestOracle;
+export class TestOracle {
+  private currentPrice: number = 1.0;
+  private confidence: number = 0.01;
   private priceHistory: PriceData[] = [];
-  private currentSlot: number = 0;
-  private lagSlots: number = 90; // ~45s at 500ms/slot target
+  private slot: number = 0;
+  private lagConfig: LagConfig;
 
-  constructor(oracle: TestOracle, initialLagSlots: number = 90) {
-    this.oracle = oracle;
-    this.lagSlots = initialLagSlots;
-    this.priceHistory = [];
+  constructor(lagConfig: LagConfig = { lagSlots: 90, targetLagMs: 45000 }) {
+    this.lagConfig = lagConfig;
   }
 
-  public setPrice(price: number, confidence: number = 0.01, slot?: number): void {
-    const ts = Date.now();
-    const effectiveSlot = slot !== undefined ? slot : this.currentSlot;
-    
-    const data: PriceData = {
+  public setPrice(price: number, conf: number = 0.01): void {
+    this.currentPrice = price;
+    this.confidence = conf;
+    this.slot += 1;
+    this.priceHistory.push({
+      price: this.currentPrice,
+      conf: this.confidence,
+      slot: this.slot,
+    });
+  }
+
+  public injectLagPrice(price: number, conf: number = 0.01): void {
+    this.slot += 1;
+    this.priceHistory.push({
       price,
-      confidence,
-      timestamp: ts,
-    };
-    
-    this.priceHistory.push(data);
-    // Keep only last 1000 entries for memory
-    if (this.priceHistory.length > 1000) {
-      this.priceHistory.shift();
-    }
-    
-    // Simulate oracle update
-    this.oracle.setPrice(price, confidence);
-    this.currentSlot = effectiveSlot + 1;
-  }
-
-  public injectLagPrice(price: number, confidence: number = 0.01): void {
-    const laggedSlot = Math.max(0, this.currentSlot - this.lagSlots);
-    this.setPrice(price, confidence, laggedSlot);
+      conf,
+      slot: this.slot - this.lagConfig.lagSlots,
+    });
+    this.currentPrice = price;
+    this.confidence = conf;
   }
 
   public getPriceHistory(): PriceData[] {
     return [...this.priceHistory];
   }
 
-  public getCurrentLag(): number {
-    return this.lagSlots;
+  public getCurrentPrice(): number {
+    return this.currentPrice;
+  }
+
+  public getCurrentConfidence(): number {
+    return this.confidence;
   }
 
   public getCurrentSlot(): number {
-    return this.currentSlot;
+    return this.slot;
   }
 
   public advanceSlot(slots: number = 1): void {
-    this.currentSlot += slots;
-  }
-
-  public setLag(newLagSlots: number): void {
-    this.lagSlots = newLagSlots;
+    this.slot += slots;
   }
 }
 
-export function createLagInjector(oracle: TestOracle, initialLagSlots: number = 90): LagInjector {
-  return new LagInjector(oracle, initialLagSlots);
+export function createLagInjector(lagSlots: number = 90): TestOracle {
+  return new TestOracle({ lagSlots, targetLagMs: 45000 });
 }
