@@ -1,133 +1,94 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Keypair, Connection, SystemProgram } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 import { Program } from "@coral-xyz/anchor";
 
 export interface PriceData {
-  price: anchor.BN;
-  confidence: anchor.BN;
-  timestamp: anchor.BN;
-  slot: anchor.BN;
+  price: number;
+  confidence: number;
+  timestamp: number;
+  slot: number;
 }
 
-export const PRICE_ACCOUNT_SIZE = 8 + 32 + 8 + 8 + 8 + 8;
+export interface OracleConfig {
+  programId: PublicKey;
+  priceAccount: PublicKey;
+  owner: Keypair;
+}
 
 export async function createPriceAccount(
   connection: Connection,
-  payer: anchor.Wallet,
-  oracleProgramId: PublicKey
+  payer: Keypair,
+  owner: Keypair
 ): Promise<PublicKey> {
-  const priceAccount = Keypair.generate();
-  const rent = await connection.getMinimumBalanceForRentExemption(PRICE_ACCOUNT_SIZE);
+  const priceAccount = anchor.web3.Keypair.generate();
+  const lamports = await connection.getMinimumBalanceForRentExemption(256);
 
   const tx = new anchor.web3.Transaction().add(
     SystemProgram.createAccount({
       fromPubkey: payer.publicKey,
       newAccountPubkey: priceAccount.publicKey,
-      space: PRICE_ACCOUNT_SIZE,
-      lamports: rent,
-      programId: oracleProgramId,
+      lamports,
+      space: 256,
+      programId: owner.publicKey, // placeholder; in real sim we use a pyth-like program
     })
   );
 
-  await anchor.web3.sendAndConfirmTransaction(connection, tx, [payer.payer, priceAccount], {
-    commitment: "confirmed",
-  });
-
+  await anchor.web3.sendAndConfirmTransaction(connection, tx, [payer, priceAccount]);
   return priceAccount.publicKey;
 }
 
 export async function updatePriceAccount(
   connection: Connection,
-  payer: anchor.Wallet,
   priceAccount: PublicKey,
-  oracleProgramId: PublicKey,
-  price: number,
-  confidence: number = 0.01,
-  timestamp?: number
+  data: PriceData,
+  owner: Keypair,
+  programId?: PublicKey
 ): Promise<void> {
-  const slot = await connection.getSlot();
-  const now = timestamp || Math.floor(Date.now() / 1000);
-
-  const data = Buffer.alloc(PRICE_ACCOUNT_SIZE);
-  data.writeBigUInt64LE(BigInt(price * 1_000_000), 40); // price
-  data.writeBigUInt64LE(BigInt(confidence * 1_000_000), 48);
-  data.writeBigUInt64LE(BigInt(now), 56);
-  data.writeBigUInt64LE(BigInt(slot), 64);
+  // In the pure-onchain test harness we write a simple account update.
+  // Real Pyth would use its own CPI; here we just overwrite the buffer for simulation.
+  const buffer = Buffer.alloc(256, 0);
+  buffer.writeDoubleLE(data.price, 0);
+  buffer.writeDoubleLE(data.confidence, 8);
+  buffer.writeBigUInt64LE(BigInt(data.timestamp), 16);
+  buffer.writeBigUInt64LE(BigInt(data.slot), 24);
 
   const tx = new anchor.web3.Transaction().add(
-    new anchor.web3.TransactionInstruction({
+    anchor.web3.ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
+    {
       keys: [
         { pubkey: priceAccount, isSigner: false, isWritable: true },
-        { pubkey: payer.publicKey, isSigner: true, isWritable: false },
+        { pubkey: owner.publicKey, isSigner: true, isWritable: false },
       ],
-      programId: oracleProgramId,
-      data: Buffer.concat([Buffer.from([0]), data]),
-    })
+      programId: programId || new PublicKey("11111111111111111111111111111111"),
+      data: buffer.slice(0, 32),
+    }
   );
 
-  await anchor.web3.sendAndConfirmTransaction(connection, tx, [payer.payer], {
-    commitment: "confirmed",
-  });
+  await anchor.web3.sendAndConfirmTransaction(connection, tx, [owner]);
 }
 
-export function createLagInjector(
-  connection: Connection,
-  payer: anchor.Wallet,
-  oracleProgramId: PublicKey,
-  lagSlots: number = 180 // ~45s at ~4 slots/sec
-) {
-  let priceAccount: PublicKey | null = null;
-  let priceHistory: Array<{ price: number; slot: number; ts: number }> = [];
+export function getLatestPrice(data: PriceData): number {
+  return data.price;
+}
 
+export function createLagInjector(config: OracleConfig) {
   return {
-    async init(): Promise<PublicKey> {
-      if (!priceAccount) {
-        priceAccount = await createPriceAccount(connection, payer, oracleProgramId);
-        // seed with initial price
-        await updatePriceAccount(connection, payer, priceAccount, oracleProgramId, 1.0);
-      }
-      return priceAccount;
-    },
-
-    async injectLagPrice(currentPrice: number, currentSlot: number, currentTs: number) {
-      if (!priceAccount) throw new Error("Injector not initialized");
-      priceHistory.push({ price: currentPrice, slot: currentSlot, ts: currentTs });
-      // replay lagged price from ~lagSlots ago
-      const lagIdx = priceHistory.length - lagSlots - 1;
-      const lagged = lagIdx >= 0 ? priceHistory[lagIdx] : priceHistory[0] || { price: currentPrice, slot: currentSlot, ts: currentTs };
+    injectLagPrice: async (price: number, confidence: number, timestamp: number, lagSlots: number) => {
+      const slot = await config.programId.connection?.getSlot() ?? 0; // fallback
+      const laggedSlot = Math.max(0, slot - lagSlots);
+      const priceData: PriceData = {
+        price,
+        confidence,
+        timestamp: timestamp || Math.floor(Date.now() / 1000),
+        slot: laggedSlot,
+      };
       await updatePriceAccount(
-        connection,
-        payer,
-        priceAccount,
-        oracleProgramId,
-        lagged.price,
-        0.01,
-        lagged.ts
+        (config.programId as any).provider.connection,
+        config.priceAccount,
+        priceData,
+        config.owner,
+        config.programId as PublicKey
       );
     },
-
-    getPriceAccount(): PublicKey {
-      if (!priceAccount) throw new Error("Injector not initialized");
-      return priceAccount;
-    },
   };
-}
-
-export async function checkTWAPFalsePositive(
-  connection: Connection,
-  vaultProgram: Program,
-  priceAccount: PublicKey,
-  jitoSolMint: PublicKey,
-  expectedTWAP: number,
-  toleranceBps: number = 50
-): Promise<boolean> {
-  // Fetch on-chain price and compute 15s TWAP
-  const accountInfo = await connection.getAccountInfo(priceAccount);
-  if (!accountInfo) return false;
-
-  const data = accountInfo.data;
-  const observedPrice = Number(data.readBigUInt64LE(40)) / 1_000_000;
-
-  const isFalsePositive = Math.abs(observedPrice - expectedTWAP) * 10000 < toleranceBps;
-  return isFalsePositive;
 }
