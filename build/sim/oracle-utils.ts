@@ -1,6 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Keypair, Connection, LAMPORTS_PER_SOL } from "@solana/web3.js";
-import { PythSolanaReceiver } from "@pythnetwork/pyth-solana-receiver";
+import { PublicKey, Keypair } from "@solana/web3.js";
+import { Program } from "@coral-xyz/anchor";
 
 export interface PriceData {
   price: number;
@@ -9,51 +9,87 @@ export interface PriceData {
 }
 
 export interface OracleConfig {
-  feedPubkey: PublicKey;
+  oracleProgramId: PublicKey;
   priceAccount: PublicKey;
+  admin: PublicKey;
 }
 
-export interface TestOracle {
-  pubkey: PublicKey;
-  toBase58(): string;
+export class TestOracle {
+  public readonly pubkey: PublicKey;
+  private data: PriceData;
+
+  constructor(pubkey: PublicKey, initialPrice: number = 1.0) {
+    this.pubkey = pubkey;
+    this.data = {
+      price: initialPrice,
+      confidence: 0.01,
+      timestamp: Math.floor(Date.now() / 1000),
+    };
+  }
+
+  public getPriceData(): PriceData {
+    return { ...this.data };
+  }
+
+  public update(price: number, confidence: number = 0.01, timestamp?: number): void {
+    this.data = {
+      price,
+      confidence,
+      timestamp: timestamp ?? Math.floor(Date.now() / 1000),
+    };
+  }
+
+  public toBase58(): string {
+    return this.pubkey.toBase58();
+  }
 }
 
-export function createTestOracle(
-  connection: Connection,
-  program: any
-): TestOracle {
-  // For sim we use a deterministic dummy key that matches expected test oracle in tick-runner
-  const dummy = new PublicKey("11111111111111111111111111111112");
-  return {
-    pubkey: dummy,
-    toBase58: () => dummy.toBase58(),
-  };
+export function createTestOracle(initialPrice: number = 1.0): TestOracle {
+  const keypair = Keypair.generate();
+  return new TestOracle(keypair.publicKey, initialPrice);
 }
 
 export async function updateTestOracle(
-  connection: Connection,
   oracle: TestOracle,
-  priceData: PriceData,
-  program: any,
-  payer: Keypair
+  price: number,
+  confidence: number = 0.01,
+  timestamp?: number
 ): Promise<void> {
-  // In pure-onchain test validator sim we simply log; real update would go through pyth receiver
-  // but lag-injector and tick-runner only care that it "succeeds" for the harness
-  console.log(`[oracle-utils] updateTestOracle slot=${(priceData as any).slot || 0} price=${priceData.price}`);
-  // No-op for CI; the actual price injection lives in lag-injector
+  oracle.update(price, confidence, timestamp);
 }
 
-export function createOracleConfig(feedPubkey: PublicKey): OracleConfig {
-  return {
-    feedPubkey,
-    priceAccount: feedPubkey, // same key for test harness
-  };
+export function createPriceAccount(
+  program: Program,
+  oracle: TestOracle,
+  price: number,
+  confidence: number = 0.01,
+  timestamp?: number
+): void {
+  oracle.update(price, confidence, timestamp);
 }
 
-export function priceToTwapCompatible(priceData: PriceData): any {
-  return {
-    price: priceData.price,
-    confidence: priceData.confidence,
-    timestamp: priceData.timestamp,
-  };
+export function updatePriceAccount(
+  program: Program,
+  oracle: TestOracle,
+  price: number,
+  confidence: number = 0.01,
+  timestamp?: number
+): void {
+  oracle.update(price, confidence, timestamp);
 }
+
+// Minimal stub for @pythnetwork/pyth-solana-receiver to satisfy the import in dependent files
+export const pythSolanaReceiver = {
+  getPythProgramKeyForCluster: () => new PublicKey("FsJ3A3u2vn5cTVofAjn4fX3sA4vJ6f1fZ3z3z3z3z3z"), // dummy
+  parsePriceFeedUpdates: () => ({}),
+};
+
+export default {
+  createTestOracle,
+  updateTestOracle,
+  createPriceAccount,
+  updatePriceAccount,
+  TestOracle,
+  PriceData: {} as any,
+  OracleConfig: {} as any,
+};
