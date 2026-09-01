@@ -1,127 +1,120 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Keypair, Connection, Transaction, SystemProgram } from "@solana/web3.js";
-import { LagInjector } from "./lag-injector";
+import { Connection, Keypair, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { createLagInjector, LagInjector } from "./lag-injector";
 import { checkTWAPFalsePositive } from "./twap-checker";
-import { createPriceAccount, updatePriceAccount } from "./oracle-utils";
+import { createTestOracle, updateTestOracle, PriceData, OracleConfig } from "./oracle-utils";
 
-interface OracleConfig {
-  oracleProgramId: PublicKey;
-  priceFeed: PublicKey;
-  admin: Keypair;
+const CLUSTER_URL = "http://127.0.0.1:8899";
+const DEFAULT_LAG_SLOTS = 135; // ~45s at 333ms/slot
+
+interface SimConfig {
+  oraclePubkey: PublicKey;
+  lagSlots: number;
+  initialPrice: number;
+  series: PriceData[];
 }
-
-interface PriceData {
-  price: number;
-  confidence: number;
-  timestamp: number;
-  slot: number;
-}
-
-const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn");
 
 async function main() {
-  const provider = anchor.AnchorProvider.env();
-  anchor.setProvider(provider);
-  const wallet = provider.wallet as anchor.Wallet;
+  const connection = new Connection(CLUSTER_URL, "confirmed");
+  const payer = Keypair.generate();
 
-  const connection = provider.connection;
+  // Fund payer
+  const airdropSig = await connection.requestAirdrop(payer.publicKey, 10 * LAMPORTS_PER_SOL);
+  await connection.confirmTransaction(airdropSig);
 
-  // Config for oracle (Pyth-like for sim)
   const oracleConfig: OracleConfig = {
-    oracleProgramId: new PublicKey("FsJ3A3u2vn5cTVofAjK6fF9fU8j2J5f9J4v3k5s5k5"),
-    priceFeed: new PublicKey("4f5v3k5s5k5J2J5f9J4v3k5s5k5J2J5f9J4v3k5s5k5"),
-    admin: Keypair.generate(), // sim admin
+    feedPubkey: new PublicKey("11111111111111111111111111111111"),
+    admin: payer,
   };
 
-  const lagInjector: LagInjector = createLagInjector(connection, oracleConfig.oracleProgramId, oracleConfig.admin);
+  const oraclePubkey = await createTestOracle(connection, payer, oracleConfig);
+  console.log("Test oracle created:", oraclePubkey.toBase58());
 
-  // Load historical Jito depeg series (last 3 simulated depegs)
-  const historicalSeries: PriceData[][] = [
-    // Series 1: normal
-    [
-      { price: 0.98, confidence: 0.01, timestamp: Date.now() / 1000, slot: 100 },
-      { price: 0.97, confidence: 0.02, timestamp: Date.now() / 1000 + 15, slot: 115 },
-      { price: 0.99, confidence: 0.01, timestamp: Date.now() / 1000 + 30, slot: 130 },
-    ],
-    // Series 2: depeg (should trip)
-    [
-      { price: 0.95, confidence: 0.05, timestamp: Date.now() / 1000, slot: 200 },
-      { price: 0.85, confidence: 0.10, timestamp: Date.now() / 1000 + 15, slot: 215 },
-      { price: 0.75, confidence: 0.15, timestamp: Date.now() / 1000 + 30, slot: 230 },
-    ],
-    // Series 3: flash crash false-positive test
-    [
-      { price: 0.92, confidence: 0.03, timestamp: Date.now() / 1000, slot: 300 },
-      { price: 0.65, confidence: 0.20, timestamp: Date.now() / 1000 + 5, slot: 305 },
-      { price: 0.94, confidence: 0.02, timestamp: Date.now() / 1000 + 20, slot: 320 },
-    ],
+  const injector: LagInjector = createLagInjector(connection, payer, oraclePubkey);
+
+  // Sample replay series (last three Jito depeg-ish points)
+  const priceSeries: PriceData[] = [
+    { price: 0.92, confidence: 0.01, timestamp: Date.now() / 1000, slot: 100 },
+    { price: 0.85, confidence: 0.02, timestamp: Date.now() / 1000 + 5, slot: 115 },
+    { price: 0.78, confidence: 0.015, timestamp: Date.now() / 1000 + 12, slot: 150 },
   ];
 
-  console.log("Starting 7-day tick simulation with lag injector...");
+  const simConfig: SimConfig = {
+    oraclePubkey,
+    lagSlots: DEFAULT_LAG_SLOTS,
+    initialPrice: 1.0,
+    series: priceSeries,
+  };
 
-  let breakerTrips = 0;
+  console.log("Starting pure-onchain Anchor JitoSOL depeg sim...");
+  await runSimulation(connection, payer, injector, simConfig);
+}
+
+async function runSimulation(
+  connection: Connection,
+  payer: Keypair,
+  injector: LagInjector,
+  config: SimConfig
+) {
+  let currentSlot = 200;
+  let tripped = false;
   let falsePositives = 0;
-  let totalTicks = 0;
 
-  // Simulate 7 days at 15s intervals (~40320 ticks)
-  const TICKS_PER_DAY = 5760; // 86400 / 15
-  for (let day = 0; day < 7; day++) {
-    for (let tick = 0; tick < TICKS_PER_DAY; tick++) {
-      totalTicks++;
-      const seriesIndex = Math.floor(Math.random() * historicalSeries.length);
-      const series = historicalSeries[seriesIndex];
+  // Seed initial price
+  await updateTestOracle(
+    connection,
+    payer,
+    config.oraclePubkey,
+    config.initialPrice,
+    0.005,
+    Date.now() / 1000,
+    currentSlot
+  );
 
-      // Inject lagged price
-      const lagSeconds = 45;
-      const injectedSlot = Math.floor(Date.now() / 400) - (lagSeconds * 2); // rough slot lag
+  for (const priceData of config.series) {
+    currentSlot += 15; // 15s tick
 
-      await lagInjector.injectLagPrice(
-        oracleConfig.priceFeed,
-        series[series.length - 1].price,
-        series[series.length - 1].confidence,
-        Math.floor(Date.now() / 1000) - lagSeconds,
-        injectedSlot
-      );
+    const laggedPrice = {
+      ...priceData,
+      slot: Math.max(0, currentSlot - config.lagSlots),
+    };
 
-      // Run TWAP false-positive checker
-      const isFalsePositive = checkTWAPFalsePositive(series, 0.10, 30); // 10% drawdown, 30s window
+    // Inject lagged price
+    await injector.injectLagPrice(
+      connection,
+      payer,
+      config.oraclePubkey,
+      laggedPrice,
+      config.lagSlots
+    );
 
-      if (isFalsePositive) {
-        falsePositives++;
-        console.log(`Tick ${totalTicks}: False positive detected (series ${seriesIndex})`);
-      } else if (series[series.length - 1].price < 0.90) {
-        breakerTrips++;
-        console.log(`Tick ${totalTicks}: Breaker TRIPPED on depeg (series ${seriesIndex})`);
-      }
+    // Check TWAP false-positive
+    const isFalsePositive = await checkTWAPFalsePositive(
+      connection,
+      config.oraclePubkey,
+      currentSlot,
+      15 // 15s window
+    );
 
-      // Simulate vault state update (no-op for sim harness)
-      if (totalTicks % 1000 === 0) {
-        console.log(`Progress: day ${day + 1}/7, ticks: ${totalTicks}, trips: ${breakerTrips}, falsePos: ${falsePositives}`);
-      }
-
-      // Sleep to simulate real-time (optional for fast runs)
-      // await new Promise(r => setTimeout(r, 10));
+    if (isFalsePositive) {
+      falsePositives++;
+      console.log(`[${currentSlot}] TWAP false-positive detected`);
+    } else if (laggedPrice.price < 0.90) {
+      tripped = true;
+      console.log(`[${currentSlot}] CIRCUIT BREAKER TRIPPED at price ${laggedPrice.price}`);
+      break;
+    } else {
+      console.log(`[${currentSlot}] price=${laggedPrice.price.toFixed(3)} (no trip)`);
     }
   }
 
-  console.log("\n=== Simulation Complete ===");
-  console.log(`Total ticks: ${totalTicks}`);
-  console.log(`Circuit breaker trips: ${breakerTrips}`);
+  console.log("\n=== SIM COMPLETE ===");
+  console.log(`Breaker trips: ${tripped ? 1 : 0}`);
   console.log(`False positives: ${falsePositives}`);
-  console.log(`False positive rate: ${((falsePositives / totalTicks) * 100).toFixed(3)}%`);
-}
-
-// Create lag injector (exported for testability)
-export function createLagInjector(connection: Connection, programId: PublicKey, admin: Keypair): LagInjector {
-  return {
-    injectLagPrice: async (priceFeed: PublicKey, price: number, confidence: number, timestamp: number, slot: number) => {
-      const priceData: PriceData = { price, confidence, timestamp, slot };
-      await updatePriceAccount(connection, programId, priceFeed, admin, priceData);
-    },
-  };
+  console.log(`Target lag: ~45s (${config.lagSlots} slots)`);
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error("Sim failed:", err);
   process.exit(1);
 });
