@@ -1,27 +1,26 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::sysvar::clock::Clock;
 use bytemuck::{Pod, Zeroable};
 use std::mem::size_of;
 
-declare_id!("Vault1111111111111111111111111111111111111111");
+declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
 #[program]
 pub mod vault {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, bumps: InitializeBumps) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
         vault.owner = ctx.accounts.owner.key();
         vault.jito_sol_mint = ctx.accounts.jito_sol_mint.key();
         vault.protection_buffer = ctx.accounts.protection_buffer.key();
         vault.paused = false;
         vault.drawdown_threshold = 500; // 5% example
-        vault.bump = bumps.vault;
+        vault.bump = ctx.bumps.vault;
         Ok(())
     }
 
-    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
+    pub fn deposit(ctx: Context<Deposit>, _amount: u64) -> Result<()> {
+        let vault = &ctx.accounts.vault;
         require!(!vault.paused, ErrorCode::Paused);
 
         // In a real program this would CPI to the JitoSOL token program
@@ -31,7 +30,7 @@ pub mod vault {
 
     pub fn drawdown_circuit_breaker(ctx: Context<DrawdownCircuitBreaker>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        let clock = Clock::get()?;
+        let _clock = Clock::get()?;
         let current_price = get_oracle_price(&ctx.accounts.price_account)?;
 
         let twap = calculate_twap(&ctx.accounts.price_history)?;
@@ -58,7 +57,7 @@ pub mod vault {
     }
 
     pub fn owner_withdraw(ctx: Context<OwnerWithdraw>, amount: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
+        let vault = &ctx.accounts.vault;
         require!(ctx.accounts.owner.key() == vault.owner, ErrorCode::Unauthorized);
         require!(vault.paused, ErrorCode::NotPaused);
 
@@ -69,7 +68,6 @@ pub mod vault {
 }
 
 #[derive(Accounts)]
-#[instruction(bumps: InitializeBumps)]
 pub struct Initialize<'info> {
     #[account(
         init,
@@ -79,8 +77,11 @@ pub struct Initialize<'info> {
         bump,
     )]
     pub vault: Account<'info, VaultState>,
+    #[account(mut)]
     pub owner: Signer<'info>,
+    /// CHECK: mint address recorded only, no data read
     pub jito_sol_mint: AccountInfo<'info>,
+    /// CHECK: buffer address recorded only, no data read
     #[account(mut)]
     pub protection_buffer: AccountInfo<'info>,
     pub system_program: Program<'info, System>,
@@ -98,7 +99,9 @@ pub struct Deposit<'info> {
 pub struct DrawdownCircuitBreaker<'info> {
     #[account(mut)]
     pub vault: Account<'info, VaultState>,
+    /// CHECK: oracle price account, validated by deserialization length check
     pub price_account: AccountInfo<'info>,
+    /// CHECK: price history account, validated by deserialization length check
     pub price_history: AccountInfo<'info>,
 }
 
@@ -118,7 +121,6 @@ pub struct OwnerWithdraw<'info> {
 }
 
 #[account]
-#[derive(Default)]
 pub struct VaultState {
     pub owner: Pubkey,
     pub jito_sol_mint: Pubkey,
@@ -130,39 +132,27 @@ pub struct VaultState {
     pub buffer: [u8; 64], // padding
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone, PartialEq)]
+#[error_code]
 pub enum ErrorCode {
+    #[msg("Vault is paused")]
     Paused,
+    #[msg("Unauthorized")]
     Unauthorized,
+    #[msg("Vault is not paused")]
     NotPaused,
+    #[msg("Invalid oracle account")]
     InvalidOracle,
+    #[msg("Insufficient protection buffer")]
     InsufficientBuffer,
-}
-
-impl From<ErrorCode> for ProgramError {
-    fn from(e: ErrorCode) -> ProgramError {
-        match e {
-            ErrorCode::Paused => ProgramError::Custom(6000),
-            ErrorCode::Unauthorized => ProgramError::Custom(6001),
-            ErrorCode::NotPaused => ProgramError::Custom(6002),
-            ErrorCode::InvalidOracle => ProgramError::Custom(6003),
-            ErrorCode::InsufficientBuffer => ProgramError::Custom(6004),
-        }
-    }
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone, PartialEq)]
-pub struct InitializeBumps {
-    pub vault: u8,
 }
 
 fn get_oracle_price(account: &AccountInfo) -> Result<u64> {
     // Stub for sim: read last price from account data
     let data = account.try_borrow_data()?;
     if data.len() < 16 {
-        return Err(ErrorCode::InvalidOracle.into());
+        return err!(ErrorCode::InvalidOracle);
     }
-    let price = u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]);
+    let price = u64::from_le_bytes(data[0..8].try_into().unwrap());
     Ok(price)
 }
 
