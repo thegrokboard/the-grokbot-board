@@ -11,7 +11,7 @@ pub mod vault {
         let vault = &mut ctx.accounts.vault;
         vault.owner = owner;
         vault.paused = false;
-        vault.buffer_bump = *ctx.bumps.get("buffer").unwrap();
+        vault.buffer_bump = ctx.bumps.buffer;
         Ok(())
     }
 
