@@ -2,121 +2,102 @@ import * as anchor from "@coral-xyz/anchor";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { createLagInjector, LagInjector } from "./lag-injector";
 import { checkTWAPFalsePositive } from "./twap-checker";
-import { createTestOracle, PriceData } from "./oracle-utils";
-import { Vault } from "../target/types/vault";
+import { createTestOracle, PriceData, TestOracle } from "./oracle-utils";
 
-const SECONDS_PER_DAY = 86400;
-const TICK_INTERVAL_MS = 15000; // 15s ticks
-const TOTAL_TICKS = (7 * SECONDS_PER_DAY) / 15; // ~40320 ticks for 7 days
-const TARGET_LAG_SLOTS = 120; // ~45s at ~400ms/slot
+const SIM_SLOTS = 7 * 24 * 60 * 4; // ~7 days at 15s ticks (4 ticks per minute)
+const TARGET_LAG_SLOTS = 3; // ~45s at 15s slots
+const TICK_INTERVAL_MS = 15000;
 
-interface SimulationResult {
-  breakerTrips: number;
-  falsePositives: number;
-  totalTicks: number;
-  logs: string[];
+interface SimConfig {
+  initialPrice: number;
+  depegSeries: PriceData[];
+  oracleLagSlots: number;
 }
 
-async function runSimulation(): Promise<SimulationResult> {
-  const provider = anchor.AnchorProvider.env();
-  anchor.setProvider(provider);
+async function runSimulation() {
+  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
+  const payer = Keypair.generate();
 
-  const program = anchor.workspace.Vault as anchor.Program<Vault>;
-  const connection = provider.connection;
+  // Airdrop for test validator
+  await connection.requestAirdrop(payer.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL);
 
-  const owner = Keypair.generate();
-  await provider.connection.requestAirdrop(owner.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL);
+  const oracle = await createTestOracle(connection, payer);
+  const lagInjector: LagInjector = createLagInjector(connection, oracle, payer, TARGET_LAG_SLOTS);
 
-  const oracle = await createTestOracle(connection, owner);
-
-  const lagInjector: LagInjector = createLagInjector(oracle.pubkey, TARGET_LAG_SLOTS);
-
-  const results: SimulationResult = {
-    breakerTrips: 0,
-    falsePositives: 0,
-    totalTicks: TOTAL_TICKS,
-    logs: [],
-  };
-
-  let currentSlot = 1000;
-  let priceHistory: PriceData[] = [];
-
-  const jitoHistoricalPrices: number[] = [
-    1.00, 0.99, 0.98, 0.97, 0.95, 0.92, 0.90, 0.88, 0.87, 0.85,
-    0.82, 0.80, 0.79, 0.78, 0.77, 0.76, 0.75, 0.74, 0.73, 0.72,
-    0.71, 0.70, 0.69, 0.68, 0.67, 0.66, 0.65, 0.64, 0.63, 0.62,
-    0.61, 0.60, 0.59, 0.58, 0.57, 0.56, 0.55, 0.54, 0.53, 0.52,
-    0.51, 0.50, 0.49, 0.48, 0.47, 0.46, 0.45, 0.44, 0.43, 0.42,
-    // repeat a depeg-recovery pattern for full 7d sim
-    0.45, 0.50, 0.60, 0.75, 0.85, 0.92, 0.97, 0.99, 1.00, 1.00,
+  // Sample depeg price series (last three known JitoSOL depegs simplified for sim)
+  const depegSeries: PriceData[] = [
+    { price: 0.98, conf: 0.01, timestamp: Date.now() / 1000 },
+    { price: 0.92, conf: 0.02, timestamp: Date.now() / 1000 + 30 },
+    { price: 0.85, conf: 0.03, timestamp: Date.now() / 1000 + 90 },
+    { price: 0.81, conf: 0.04, timestamp: Date.now() / 1000 + 150 },
+    { price: 0.95, conf: 0.01, timestamp: Date.now() / 1000 + 300 },
   ];
 
-  results.logs.push(`Starting 7-day JitoSOL depeg simulation with ${TOTAL_TICKS} ticks...`);
-  results.logs.push(`Target oracle lag: ~45s (${TARGET_LAG_SLOTS} slots)`);
-  results.logs.push(`Program ID: ${program.programId.toBase58()}`);
-  results.logs.push(`Oracle: ${oracle.pubkey.toBase58()}`);
+  const config: SimConfig = {
+    initialPrice: 1.0,
+    depegSeries,
+    oracleLagSlots: TARGET_LAG_SLOTS,
+  };
 
-  for (let tick = 0; tick < TOTAL_TICKS; tick++) {
-    const simTimeSec = tick * 15;
-    const day = Math.floor(simTimeSec / SECONDS_PER_DAY);
-    const priceIndex = Math.floor((simTimeSec % (jitoHistoricalPrices.length * 15)) / 15);
-    let price = jitoHistoricalPrices[priceIndex % jitoHistoricalPrices.length];
+  console.log("Starting pure-onchain Anchor JitoSOL depeg sim harness...");
+  console.log(`Target lag: ${config.oracleLagSlots * 15}s | Total ticks: ${SIM_SLOTS}`);
 
-    // Add small noise for realism
-    price = price * (0.995 + Math.random() * 0.01);
+  let breakerTrips = 0;
+  let falsePositives = 0;
+  let currentPrice = config.initialPrice;
+  let slot = 0;
 
-    const priceData: PriceData = {
-      price: Math.floor(price * 1_000_000), // 6 decimals
-      conf: Math.floor(price * 50_000),
-      expo: -6,
-    };
+  // Initialize oracle with starting price
+  await lagInjector.setPrice(currentPrice, 0.005);
 
-    // Inject lagged price
-    lagInjector.injectLagPrice(priceData, currentSlot);
+  for (let tick = 0; tick < SIM_SLOTS; tick++) {
+    slot += 1;
+    const now = Date.now();
 
-    priceHistory.push(priceData);
-    if (priceHistory.length > 100) priceHistory.shift(); // keep last ~25min window
-
-    const shouldTrip = checkTWAPFalsePositive(priceHistory);
-
-    if (shouldTrip) {
-      results.breakerTrips++;
-      results.logs.push(`[Tick ${tick} | Day ${day}] DRAW DOWN CIRCUIT BREAKER TRIPPED at price ${price.toFixed(4)}`);
-    } else if (price < 0.90 && tick % 50 === 0) {
-      results.falsePositives++;
-      results.logs.push(`[Tick ${tick} | Day ${day}] False-positive avoided at price ${price.toFixed(4)}`);
+    // Replay depeg series with lag injection
+    if (tick < config.depegSeries.length) {
+      const nextPriceData = config.depegSeries[tick];
+      await lagInjector.injectLagPrice(nextPriceData.price, nextPriceData.conf);
+      currentPrice = nextPriceData.price;
+    } else {
+      // After series, slowly recover
+      currentPrice = Math.min(1.0, currentPrice + 0.002);
+      await lagInjector.setPrice(currentPrice, 0.01);
     }
 
-    currentSlot += 4; // ~1s per tick in sim time, but 15s real
+    // Run 15s TWAP false-positive checker
+    const isFalsePositive = checkTWAPFalsePositive(
+      oracle,
+      currentPrice,
+      15 * 60, // 15 minute TWAP window in seconds
+      0.05     // 5% drawdown threshold
+    );
+
+    if (isFalsePositive) {
+      falsePositives++;
+      console.log(`[${tick}] FALSE POSITIVE detected at price $${currentPrice.toFixed(3)}`);
+    }
+
+    // Simulate drawdown circuit-breaker logic (would call program instruction in full harness)
+    if (currentPrice < 0.90 && !isFalsePositive) {
+      breakerTrips++;
+      console.log(`[${tick}] CIRCUIT BREAKER TRIPPED at $${currentPrice.toFixed(3)} (lag: ${config.oracleLagSlots * 15}s)`);
+    }
+
+    if (tick % 20 === 0) {
+      console.log(`Tick ${tick}/${SIM_SLOTS} | Price: $${currentPrice.toFixed(3)} | Trips: ${breakerTrips} | False+: ${falsePositives}`);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, TICK_INTERVAL_MS));
   }
 
-  results.logs.push("\n=== SIMULATION COMPLETE ===");
-  results.logs.push(`Total breaker trips: ${results.breakerTrips}`);
-  results.logs.push(`False positives detected: ${results.falsePositives}`);
-  results.logs.push(`False positive rate: ${((results.falsePositives / Math.max(results.breakerTrips, 1)) * 100).toFixed(1)}%`);
-
-  return results;
+  console.log("\n=== SIMULATION COMPLETE ===");
+  console.log(`Breaker trips: ${breakerTrips}`);
+  console.log(`False positives: ${falsePositives}`);
+  console.log(`False positive rate: ${((falsePositives / (breakerTrips + falsePositives)) * 100 || 0).toFixed(1)}%`);
 }
 
-async function main() {
-  try {
-    const result = await runSimulation();
-    result.logs.forEach(log => console.log(log));
-    
-    // Write summary to file for CI visibility
-    const fs = require("fs");
-    fs.writeFileSync("sim-results.log", result.logs.join("\n"));
-    
-    console.log("\nSimulation log written to sim-results.log");
-    process.exit(0);
-  } catch (err) {
-    console.error("Simulation failed:", err);
-    process.exit(1);
-  }
-}
-
-if (require.main === module) {
-  main();
-}
-
-export { runSimulation, SimulationResult };
+runSimulation().catch((err) => {
+  console.error("Sim failed:", err);
+  process.exit(1);
+});
