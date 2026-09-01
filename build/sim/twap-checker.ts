@@ -1,166 +1,85 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
-import { Vault } from "../target/types/vault";
+import { PublicKey } from "@solana/web3.js";
+import { createPriceAccount, PriceData, updatePriceAccount } from "./oracle-utils";
 
-interface PriceTick {
-  slot: number;
-  price: number; // jitoSOL price in USD (scaled)
-  timestamp: number;
+export interface TwapState {
+  lastUpdateSlot: number;
+  prices: { slot: number; price: number }[];
+  twap: number;
+  periodSlots: number;
 }
 
-export class TwapChecker {
-  private connection: Connection;
-  private program: anchor.Program<Vault>;
-  private oraclePubkey: PublicKey;
-  private windowSeconds: number = 15;
-  private falsePositiveThreshold: number = 0.02; // 2% drawdown
-
-  constructor(
-    connection: Connection,
-    program: anchor.Program<Vault>,
-    oraclePubkey: PublicKey
-  ) {
-    this.connection = connection;
-    this.program = program;
-    this.oraclePubkey = oraclePubkey;
-  }
-
-  /**
-   * Runs 15s TWAP false-positive detection over a replayed price series.
-   * Returns { breakerTrips, falsePositives, logs }
-   */
-  async checkSeries(ticks: PriceTick[]): Promise<{
-    breakerTrips: number;
-    falsePositives: number;
-    logs: string[];
-  }> {
-    const logs: string[] = [];
-    let breakerTrips = 0;
-    let falsePositives = 0;
-
-    if (ticks.length < 2) {
-      logs.push("Insufficient ticks for TWAP check");
-      return { breakerTrips, falsePositives, logs };
-    }
-
-    // Sort by slot just in case
-    const sortedTicks = [...ticks].sort((a, b) => a.slot - b.slot);
-
-    let windowStartIdx = 0;
-    for (let i = 1; i < sortedTicks.length; i++) {
-      const current = sortedTicks[i];
-      const windowStart = sortedTicks[windowStartIdx];
-
-      // Slide window to keep it within 15 seconds
-      while (
-        current.timestamp - windowStart.timestamp > this.windowSeconds &&
-        windowStartIdx < i
-      ) {
-        windowStartIdx++;
-      }
-
-      if (i - windowStartIdx < 1) continue;
-
-      // Compute simple TWAP over the window
-      let sum = 0;
-      let count = 0;
-      for (let j = windowStartIdx; j <= i; j++) {
-        sum += sortedTicks[j].price;
-        count++;
-      }
-      const twap = sum / count;
-      const latestPrice = current.price;
-
-      const drawdown = (twap - latestPrice) / twap;
-
-      if (drawdown > this.falsePositiveThreshold) {
-        breakerTrips++;
-        logs.push(
-          `BREACH at slot ${current.slot}: TWAP=${twap.toFixed(
-            4
-          )}, price=${latestPrice.toFixed(4)}, drawdown=${(
-            drawdown * 100
-          ).toFixed(2)}%`
-        );
-
-        // Simulate calling the on-chain circuit breaker (dry-run)
-        try {
-          await this.program.methods
-            .triggerDrawdownBreaker(new anchor.BN(Math.floor(latestPrice * 1e9)))
-            .accounts({
-              oracle: this.oraclePubkey,
-              authority: this.program.provider.publicKey!,
-            })
-            .rpc({ commitment: "confirmed" });
-          logs.push(`  -> breaker instruction succeeded on-chain`);
-        } catch (err: any) {
-          logs.push(`  -> breaker instruction failed: ${err.message}`);
-        }
-      } else if (drawdown > 0.005) {
-        // near-miss that should not trigger
-        falsePositives++;
-        logs.push(
-          `NEAR-MISS at slot ${current.slot}: drawdown=${(
-            drawdown * 100
-          ).toFixed(2)}% (under threshold)`
-        );
-      }
-    }
-
-    logs.push(
-      `TWAP check complete. Trips: ${breakerTrips}, False positives: ${falsePositives}`
-    );
-    return { breakerTrips, falsePositives, logs };
-  }
+export function createTwapChecker(
+  periodSeconds: number = 15,
+  slotDurationMs: number = 400
+): TwapState {
+  const periodSlots = Math.ceil((periodSeconds * 1000) / slotDurationMs);
+  return {
+    lastUpdateSlot: 0,
+    prices: [],
+    twap: 0,
+    periodSlots,
+  };
 }
 
-// ------------------------------------------------------------------
-// Lightweight in-memory 15s TWAP false-positive check used by the
-// tick-runner sim loop. Given the recent price history and a drawdown
-// threshold, returns true when the latest print deviates from the
-// short TWAP by more than the threshold while the TWAP itself is
-// still healthy (a lag artifact, not a real depeg).
-// ------------------------------------------------------------------
-export function checkTWAPFalsePositive(
-  priceHistory: number[],
-  threshold: number
+export function updateTwap(
+  state: TwapState,
+  currentSlot: number,
+  price: number
+): void {
+  // Add new price
+  state.prices.push({ slot: currentSlot, price });
+
+  // Remove prices older than the window
+  const cutoffSlot = currentSlot - state.periodSlots;
+  while (state.prices.length > 0 && state.prices[0].slot < cutoffSlot) {
+    state.prices.shift();
+  }
+
+  if (state.prices.length === 0) {
+    state.twap = price;
+    state.lastUpdateSlot = currentSlot;
+    return;
+  }
+
+  // Simple time-weighted average (equal weight per observation for sim)
+  let sum = 0;
+  for (const p of state.prices) {
+    sum += p.price;
+  }
+  state.twap = sum / state.prices.length;
+  state.lastUpdateSlot = currentSlot;
+}
+
+export function isFalsePositive(
+  state: TwapState,
+  currentPrice: number,
+  depegThreshold: number = 0.05 // 5% deviation from TWAP
 ): boolean {
-  if (priceHistory.length < 3) return false;
-
-  // TWAP over the last window (up to 30 samples ~ 15s of ticks)
-  const window = priceHistory.slice(-30);
-  const twap = window.reduce((s, p) => s + p, 0) / window.length;
-  const latest = priceHistory[priceHistory.length - 1];
-
-  const deviation = (twap - latest) / twap;
-
-  // Transient spike: latest print breaches the threshold vs TWAP,
-  // but the TWAP itself has not depegged. Treat as false positive.
-  return deviation > threshold && twap > 0.97;
+  if (state.prices.length < 2) return false;
+  const deviation = Math.abs(currentPrice - state.twap) / state.twap;
+  return deviation < depegThreshold;
 }
 
-// Export a helper to run against the last three Jito depeg series (placeholder data for CI)
-export async function runFalsePositiveCheck(
-  connection: Connection,
-  program: anchor.Program<Vault>,
-  oracle: PublicKey
-): Promise<void> {
-  const checker = new TwapChecker(connection, program, oracle);
+// High-level helper used by tick-runner
+export async function createAndUpdateTwapChecker(
+  connection: anchor.web3.Connection,
+  priceAccount: PublicKey,
+  state: TwapState,
+  currentSlot: number
+): Promise<boolean> {
+  const accountInfo = await connection.getAccountInfo(priceAccount);
+  if (!accountInfo) throw new Error("Price account not found");
 
-  // Sample replay data derived from the three historical Jito depegs
-  const sampleSeries: PriceTick[] = [
-    { slot: 100, price: 1.000, timestamp: 0 },
-    { slot: 105, price: 0.995, timestamp: 3 },
-    { slot: 110, price: 0.982, timestamp: 7 },
-    { slot: 115, price: 0.960, timestamp: 12 },
-    { slot: 120, price: 0.935, timestamp: 16 },
-    { slot: 125, price: 0.910, timestamp: 20 },
-    { slot: 130, price: 0.885, timestamp: 25 },
-  ];
+  const priceData: PriceData = {
+    price: new anchor.BN(0),
+    slot: new anchor.BN(0),
+  };
 
-  const result = await checker.checkSeries(sampleSeries);
-  console.log(result.logs.join("\n"));
-  console.log(
-    `Summary - Breaker trips: ${result.breakerTrips}, False positives: ${result.falsePositives}`
-  );
+  // Minimal parse for sim (real Pyth/Oracle would use proper layout; here we use dummy)
+  // For this harness we assume priceAccount stores raw u64 price in first 8 bytes
+  const price = Number(accountInfo.data.readBigUInt64LE(0)) / 1e9; // normalize to SOL-like scale
+
+  updateTwap(state, currentSlot, price);
+  return isFalsePositive(state, price);
 }
