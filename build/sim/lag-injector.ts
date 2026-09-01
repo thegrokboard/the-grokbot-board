@@ -1,71 +1,39 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey, Transaction, SystemProgram } from "@solana/web3.js";
-import { OracleConfig, PriceData } from "./oracle-utils";
+import { PublicKey, Keypair } from "@solana/web3.js";
+import { PriceData, TestOracle } from "./oracle-utils";
 
-export interface LagInjector {
-  injectLagPrice: (
-    connection: Connection,
-    payer: Keypair,
-    oraclePubkey: PublicKey,
-    priceData: PriceData,
-    lagSlots: number
-  ) => Promise<string>;
+export interface OracleConfig {
+  oracle: PublicKey;
+  feed: PublicKey;
 }
 
-export function createLagInjector(config: OracleConfig): LagInjector {
-  const programId = new PublicKey(config.programId);
+export interface LagInjector {
+  injectLagPrice: (lagSeconds: number, currentSlot: number, priceSeries: PriceData[]) => Promise<void>;
+}
 
-  async function injectLagPrice(
-    connection: Connection,
-    payer: Keypair,
-    oraclePubkey: PublicKey,
-    priceData: PriceData,
-    lagSlots: number
-  ): Promise<string> {
-    // Simulate lagged oracle update by creating a transaction that sets a price
-    // with a computed slot that is behind by lagSlots. In a real test validator
-    // this would update a mock Switchboard or Pyth-like account.
-    const currentSlot = await connection.getSlot();
-    const laggedSlot = Math.max(0, currentSlot - lagSlots);
+export function createLagInjector(
+  provider: anchor.Provider,
+  program: anchor.Program,
+  config: OracleConfig
+): LagInjector {
+  const oracle = new TestOracle(config.oracle, provider.connection);
 
-    const updatedPrice: PriceData = {
-      ...priceData,
-      slot: laggedSlot,
-      timestamp: Math.floor(Date.now() / 1000) - Math.floor(lagSlots * 0.4), // rough 400ms per slot
-    };
+  async function injectLagPrice(lagSeconds: number, currentSlot: number, priceSeries: PriceData[]): Promise<void> {
+    if (priceSeries.length === 0) return;
 
-    // For the sim we send a mock update instruction (assuming a simple oracle program)
-    const instructionData = Buffer.from(
-      JSON.stringify({
-        price: updatedPrice.price,
-        confidence: updatedPrice.confidence,
-        slot: updatedPrice.slot,
-      })
-    );
+    // Replay the last three prices with configurable lag (target ~45s)
+    const recentPrices = priceSeries.slice(-3);
+    const slotLag = Math.floor((lagSeconds * 2)); // approx 2 slots per second on local validator
 
-    const tx = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey: payer.publicKey,
-        toPubkey: oraclePubkey,
-        lamports: 1,
-      })
-    );
-
-    // In real usage this would be replaced by the actual oracle update instruction
-    // but for this harness we just advance the slot and log the injection.
-    tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-    tx.sign(payer);
-
-    const sig = await connection.sendRawTransaction(tx.serialize(), {
-      skipPreflight: true,
-    });
-    await connection.confirmTransaction(sig, "confirmed");
-
-    console.log(`[LagInjector] Injected lagged price ${updatedPrice.price} at slot ${laggedSlot} (lag=${lagSlots})`);
-    return sig;
+    for (const price of recentPrices) {
+      const laggedSlot = Math.max(0, currentSlot - slotLag);
+      await oracle.setPrice({
+        price: price.price,
+        confidence: price.confidence,
+        timestamp: price.timestamp,
+      }, laggedSlot);
+    }
   }
 
-  return {
-    injectLagPrice,
-  };
+  return { injectLagPrice };
 }
