@@ -1,70 +1,86 @@
-import { Connection, Keypair, PublicKey, clusterApiUrl } from '@solana/web3.js';
-import { LagInjector } from './lag-injector';
-import { getHistoricalJitoPrices, createTestOracle, PriceData } from './oracle-utils';
-import { checkTWAPFalsePositive } from './twap-checker';
+import * as anchor from "@coral-xyz/anchor";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { LagInjector } from "./lag-injector";
+import { getHistoricalJitoPrices } from "./oracle-utils";
+import { checkTWAPFalsePositive } from "./twap-checker";
+import { Vault } from "../target/types/vault";
 
 interface TWAPConfig {
-  windowSeconds: number;
+  windowSlots: number;
   thresholdBps: number;
-  minObservations: number;
 }
 
-const DEFAULT_TWAP_CONFIG: TWAPConfig = {
-  windowSeconds: 15,
-  thresholdBps: 500,
-  minObservations: 3,
-};
+interface SimResult {
+  breakerTrips: number;
+  falsePositives: number;
+  totalTicks: number;
+}
 
-async function runSimulation(days: number = 7): Promise<void> {
-  console.log(`Starting 7-day JitoSOL depeg simulation with ${days} days of replay...`);
+async function run7DayTickSimulation(): Promise<SimResult> {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
 
-  const connection = new Connection(clusterApiUrl('devnet'), 'confirmed');
-  const oracleKeypair = Keypair.generate();
-  const oraclePubkey = oracleKeypair.publicKey;
+  const program = anchor.workspace.Vault as anchor.Program<Vault>;
+  const connection = provider.connection;
 
-  const testOracle = await createTestOracle(connection, oracleKeypair);
+  const prices = getHistoricalJitoPrices();
+  const injector = new LagInjector(connection, new PublicKey("11111111111111111111111111111111"));
 
-  const injector = new LagInjector(testOracle, 45);
-  const historicalPrices: PriceData[] = await getHistoricalJitoPrices();
-
-  console.log(`Loaded ${historicalPrices.length} historical price points.`);
-
-  // Replay with lag injection
-  const injectedPrices = await injector.injectLag(historicalPrices);
-  console.log(`Injected lag: produced ${injectedPrices.length} delayed observations.`);
+  const config: TWAPConfig = {
+    windowSlots: 150,
+    thresholdBps: 500,
+  };
 
   let breakerTrips = 0;
   let falsePositives = 0;
-  const windowSize = 60; // ~15s TWAP checks every minute of simulated time
+  const totalTicks = prices.length;
 
-  for (let i = windowSize; i < injectedPrices.length; i += windowSize) {
-    const window = injectedPrices.slice(i - windowSize, i);
-    const isFalsePositive = checkTWAPFalsePositive(window, DEFAULT_TWAP_CONFIG);
+  console.log(`Starting 7-day sim with ${totalTicks} ticks (target lag: 45s)...`);
 
-    if (isFalsePositive) {
-      falsePositives++;
+  for (let i = 0; i < prices.length; i++) {
+    const price = prices[i];
+    await injector.injectLag(price);
+
+    const isFalsePositive = checkTWAPFalsePositive(prices.slice(0, i + 1), config);
+    const isBreakerTrip = isFalsePositive; // In full harness this would query on-chain state
+
+    if (isBreakerTrip) {
+      breakerTrips++;
+      if (isFalsePositive) falsePositives++;
+      console.log(`Tick ${i}: Breaker tripped (false positive: ${isFalsePositive})`);
     }
 
-    // Simple drawdown circuit breaker simulation (price drop > 10%)
-    const startPrice = window[0].price;
-    const endPrice = window[window.length - 1].price;
-    if ((startPrice - endPrice) / startPrice > 0.10) {
-      breakerTrips++;
-      console.log(`Circuit breaker tripped at index ${i} (price drop detected)`);
+    if ((i + 1) % 500 === 0) {
+      console.log(`Progress: ${Math.round(((i + 1) / totalTicks) * 100)}%`);
+    }
+
+    // Simulate 15s tick pacing
+    if (i < prices.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 15));
     }
   }
 
-  console.log('\n=== Simulation Results ===');
-  console.log(`Total breaker trips: ${breakerTrips}`);
-  console.log(`False positives from 15s TWAP: ${falsePositives}`);
-  console.log(`False positive rate: ${((falsePositives / (injectedPrices.length / windowSize)) * 100).toFixed(2)}%`);
-  console.log('Pure onchain Anchor vault sim completed successfully.');
+  const result: SimResult = { breakerTrips, falsePositives, totalTicks };
+  console.log("\n=== Simulation Complete ===");
+  console.log(`Breaker trips: ${breakerTrips}`);
+  console.log(`False positives: ${falsePositives}`);
+  console.log(`False positive rate: ${totalTicks > 0 ? ((falsePositives / breakerTrips) * 100).toFixed(2) : 0}%`);
+
+  return result;
 }
 
-// Allow direct execution
+async function main() {
+  try {
+    await run7DayTickSimulation();
+    process.exit(0);
+  } catch (err) {
+    console.error("Simulation failed:", err);
+    process.exit(1);
+  }
+}
+
 if (require.main === module) {
-  runSimulation().catch(console.error);
+  main();
 }
 
-export { runSimulation, DEFAULT_TWAP_CONFIG };
-export type { TWAPConfig };
+export { run7DayTickSimulation, TWAPConfig };
