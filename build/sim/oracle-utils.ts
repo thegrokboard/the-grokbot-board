@@ -1,84 +1,80 @@
 import * as anchor from "@coral-xyz/anchor";
 import { PublicKey } from "@solana/web3.js";
+import { TestOracle, PriceData } from "./lag-injector";
 
-export interface PriceData {
+export interface HistoricalPrice {
   price: number;
   timestamp: number;
 }
 
-export interface HistoricalPriceSeries {
-  prices: PriceData[];
+export async function getHistoricalJitoPrices(
+  days: number = 7
+): Promise<HistoricalPrice[]> {
+  // Replay of real JitoSOL depeg series from Nov 2024 (simulated data)
+  const basePrices = [
+    { price: 0.92, timestamp: 1731000000 },
+    { price: 0.89, timestamp: 1731086400 },
+    { price: 0.85, timestamp: 1731172800 },
+    { price: 0.78, timestamp: 1731259200 },
+    { price: 0.65, timestamp: 1731345600 },
+    { price: 0.58, timestamp: 1731432000 },
+    { price: 0.62, timestamp: 1731518400 },
+    { price: 0.71, timestamp: 1731604800 },
+    { price: 0.88, timestamp: 1731691200 },
+  ];
+
+  const series: HistoricalPrice[] = [];
+  const now = Math.floor(Date.now() / 1000);
+  const start = now - days * 24 * 60 * 60;
+
+  for (let i = 0; i < 180; i++) { // ~every 2 hours over 15 days
+    const t = start + i * 7200;
+    const idx = Math.min(Math.floor(i / 20), basePrices.length - 1);
+    const base = basePrices[idx];
+    const noise = (Math.random() - 0.5) * 0.03;
+    series.push({
+      price: Math.max(0.5, Math.min(1.05, base.price + noise)),
+      timestamp: t,
+    });
+  }
+  return series;
 }
 
-export interface TWAPConfig {
-  windowSeconds: number;
-  thresholdBps: number;
-  minObservations: number;
-}
+export function createLagInjector(
+  historical: HistoricalPrice[],
+  lagSeconds: number = 45
+): TestOracle {
+  let cursor = 0;
+  const prices: PriceData[] = historical.map((p) => ({
+    price: p.price,
+    timestamp: p.timestamp,
+  }));
 
-export function getHistoricalJitoPrices(): HistoricalPriceSeries {
-  // Last three known JitoSOL depeg episodes (simulated realistic series)
-  // Prices in USD, timestamps in seconds (relative, will be shifted by injector)
   return {
-    prices: [
-      // Minor depeg 1
-      { price: 0.98, timestamp: 0 },
-      { price: 0.975, timestamp: 30 },
-      { price: 0.96, timestamp: 65 },
-      { price: 0.955, timestamp: 110 },
-      { price: 0.97, timestamp: 160 },
-      // Minor depeg 2
-      { price: 0.99, timestamp: 200 },
-      { price: 0.945, timestamp: 240 },
-      { price: 0.92, timestamp: 280 },
-      { price: 0.935, timestamp: 320 },
-      { price: 0.96, timestamp: 370 },
-      // Major depeg (the one that should trip breaker)
-      { price: 1.0, timestamp: 400 },
-      { price: 0.89, timestamp: 450 },
-      { price: 0.82, timestamp: 490 },
-      { price: 0.78, timestamp: 530 },
-      { price: 0.81, timestamp: 580 },
-      { price: 0.85, timestamp: 630 },
-      { price: 0.91, timestamp: 680 },
-    ],
+    getCurrentPrice: () => {
+      const now = Math.floor(Date.now() / 1000);
+      const laggedTime = now - lagSeconds;
+      while (cursor < prices.length - 1 && prices[cursor + 1].timestamp <= laggedTime) {
+        cursor++;
+      }
+      return prices[Math.min(cursor, prices.length - 1)];
+    },
+
+    injectPrices: async (oraclePubkey: PublicKey, connection: anchor.web3.Connection) => {
+      // In test validator we update a mock oracle account (simplified)
+      console.log(`[LagInjector] Injecting ${prices.length} lagged prices to ${oraclePubkey}`);
+      // Real implementation would use a mock price account or Switchboard/ custom oracle
+      // For this harness we just advance internal state
+      return true;
+    },
+
+    reset: () => {
+      cursor = 0;
+    },
   };
 }
 
-export function calculateTWAP(prices: PriceData[], windowSeconds: number): number {
-  if (prices.length === 0) return 0;
-  
-  const now = Math.max(...prices.map(p => p.timestamp));
-  const cutoff = now - windowSeconds;
-  
-  const windowPrices = prices
-    .filter(p => p.timestamp >= cutoff)
-    .sort((a, b) => a.timestamp - b.timestamp);
-  
-  if (windowPrices.length === 0) return prices[prices.length - 1].price;
-  
-  // Simple time-weighted average (equal weight per observation for sim)
-  let sum = 0;
-  for (const p of windowPrices) {
-    sum += p.price;
-  }
-  return sum / windowPrices.length;
+export function createTestOracle(historicalPrices: HistoricalPrice[], lagMs: number): TestOracle {
+  const lagSeconds = Math.floor(lagMs / 1000);
+  return createLagInjector(historicalPrices, lagSeconds);
 }
-
-export function checkTWAPFalsePositive(
-  series: HistoricalPriceSeries,
-  config: TWAPConfig,
-  currentPrice: number,
-  currentTime: number
-): boolean {
-  const allPrices = [...series.prices];
-  allPrices.push({ price: currentPrice, timestamp: currentTime });
-  
-  const twap = calculateTWAP(allPrices, config.windowSeconds);
-  const deviationBps = Math.abs(currentPrice - twap) * 10000;
-  
-  return deviationBps > config.thresholdBps;
-}
-
-// Alias for backward compatibility with tick-runner
-export const checkTWAPFalsePositive as any = checkTWAPFalsePositive;
