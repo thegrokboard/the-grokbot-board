@@ -1,80 +1,191 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey } from "@solana/web3.js";
-import { TestOracle, PriceData } from "./lag-injector";
+import { Connection, PublicKey } from "@solana/web3.js";
 
-export interface HistoricalPrice {
-  price: number;
-  timestamp: number;
+// Core price data type used across the simulator (no slot or confidence per spec)
+export interface PriceData {
+  price: number;        // normalized price (e.g. 0.95 for depeg)
+  timestamp: number;    // unix timestamp in seconds
 }
 
-export async function getHistoricalJitoPrices(
-  days: number = 7
-): Promise<HistoricalPrice[]> {
-  // Replay of real JitoSOL depeg series from Nov 2024 (simulated data)
-  const basePrices = [
-    { price: 0.92, timestamp: 1731000000 },
-    { price: 0.89, timestamp: 1731086400 },
-    { price: 0.85, timestamp: 1731172800 },
-    { price: 0.78, timestamp: 1731259200 },
-    { price: 0.65, timestamp: 1731345600 },
-    { price: 0.58, timestamp: 1731432000 },
-    { price: 0.62, timestamp: 1731518400 },
-    { price: 0.71, timestamp: 1731604800 },
-    { price: 0.88, timestamp: 1731691200 },
-  ];
+// Historical prices for replay
+export type HistoricalPrice = PriceData;
 
-  const series: HistoricalPrice[] = [];
-  const now = Math.floor(Date.now() / 1000);
-  const start = now - days * 24 * 60 * 60;
+// Oracle abstraction used by lag injector and TWAP checker
+export interface TestOracle {
+  getPriceAt(ts: number): Promise<PriceData | null>;
+  getHistoricalPrices(): Promise<HistoricalPrice[]>;
+}
 
-  for (let i = 0; i < 180; i++) { // ~every 2 hours over 15 days
-    const t = start + i * 7200;
-    const idx = Math.min(Math.floor(i / 20), basePrices.length - 1);
-    const base = basePrices[idx];
-    const noise = (Math.random() - 0.5) * 0.03;
-    series.push({
-      price: Math.max(0.5, Math.min(1.05, base.price + noise)),
-      timestamp: t,
-    });
+// Simple in-memory oracle for test validator replay
+export class InMemoryOracle implements TestOracle {
+  private prices: HistoricalPrice[];
+
+  constructor(initialPrices: HistoricalPrice[]) {
+    this.prices = [...initialPrices].sort((a, b) => a.timestamp - b.timestamp);
   }
-  return series;
+
+  async getPriceAt(ts: number): Promise<PriceData | null> {
+    if (this.prices.length === 0) return null;
+    // find the most recent price before or at ts
+    let closest: PriceData | null = null;
+    for (const p of this.prices) {
+      if (p.timestamp > ts) break;
+      closest = p;
+    }
+    return closest;
+  }
+
+  async getHistoricalPrices(): Promise<HistoricalPrice[]> {
+    return [...this.prices];
+  }
 }
 
-export function createLagInjector(
-  historical: HistoricalPrice[],
-  lagSeconds: number = 45
-): TestOracle {
-  let cursor = 0;
-  const prices: PriceData[] = historical.map((p) => ({
-    price: p.price,
-    timestamp: p.timestamp,
-  }));
+// JitoSOL specific price series (last three depeg events - synthetic but realistic)
+export const jitoDepegSeries: HistoricalPrice[] = [
+  // First depeg series (approx 2024-03)
+  { price: 0.998, timestamp: 1710000000 },
+  { price: 0.975, timestamp: 1710003600 },
+  { price: 0.942, timestamp: 1710007200 },
+  { price: 0.918, timestamp: 1710010800 },
+  { price: 0.935, timestamp: 1710014400 },
+  { price: 0.962, timestamp: 1710018000 },
+  { price: 0.981, timestamp: 1710021600 },
+  // Second depeg series (approx 2024-04)
+  { price: 0.999, timestamp: 1712000000 },
+  { price: 0.967, timestamp: 1712003600 },
+  { price: 0.931, timestamp: 1712007200 },
+  { price: 0.904, timestamp: 1712010800 },
+  { price: 0.922, timestamp: 1712014400 },
+  { price: 0.955, timestamp: 1712018000 },
+  { price: 0.988, timestamp: 1712021600 },
+  // Third depeg series (approx 2024-05) - the one used for 45s lag tests
+  { price: 1.000, timestamp: 1714000000 },
+  { price: 0.982, timestamp: 1714003600 },
+  { price: 0.951, timestamp: 1714007200 },
+  { price: 0.912, timestamp: 1714010800 },
+  { price: 0.889, timestamp: 1714014400 },
+  { price: 0.905, timestamp: 1714018000 },
+  { price: 0.937, timestamp: 1714021600 },
+  { price: 0.972, timestamp: 1714025200 },
+  { price: 0.991, timestamp: 1714028800 },
+];
 
+// Utility to create a lagged oracle (45s target lag, slot-exact simulation via timestamp offset)
+export function createLaggedOracle(baseOracle: TestOracle, lagSeconds: number = 45): TestOracle {
   return {
-    getCurrentPrice: () => {
-      const now = Math.floor(Date.now() / 1000);
-      const laggedTime = now - lagSeconds;
-      while (cursor < prices.length - 1 && prices[cursor + 1].timestamp <= laggedTime) {
-        cursor++;
-      }
-      return prices[Math.min(cursor, prices.length - 1)];
+    async getPriceAt(ts: number): Promise<PriceData | null> {
+      const laggedTs = ts - lagSeconds;
+      return baseOracle.getPriceAt(laggedTs);
     },
-
-    injectPrices: async (oraclePubkey: PublicKey, connection: anchor.web3.Connection) => {
-      // In test validator we update a mock oracle account (simplified)
-      console.log(`[LagInjector] Injecting ${prices.length} lagged prices to ${oraclePubkey}`);
-      // Real implementation would use a mock price account or Switchboard/ custom oracle
-      // For this harness we just advance internal state
-      return true;
-    },
-
-    reset: () => {
-      cursor = 0;
+    async getHistoricalPrices(): Promise<HistoricalPrice[]> {
+      return baseOracle.getHistoricalPrices();
     },
   };
 }
 
-export function createTestOracle(historicalPrices: HistoricalPrice[], lagMs: number): TestOracle {
-  const lagSeconds = Math.floor(lagMs / 1000);
-  return createLagInjector(historicalPrices, lagSeconds);
+// 15s TWAP calculator used by false-positive checker
+export function calculateTWAP(prices: HistoricalPrice[], windowSeconds: number = 15): number | null {
+  if (prices.length === 0) return null;
+  const now = Math.max(...prices.map(p => p.timestamp));
+  const cutoff = now - windowSeconds;
+  const windowPrices = prices.filter(p => p.timestamp >= cutoff);
+  if (windowPrices.length === 0) return null;
+  const sum = windowPrices.reduce((acc, p) => acc + p.price, 0);
+  return sum / windowPrices.length;
 }
+
+// Export TWAP config type for tick-runner compatibility
+export interface TWAPConfig {
+  windowSeconds: number;
+  depegThreshold: number;   // e.g. 0.94
+  falsePositiveTolerance: number;
+}
+
+// Default config used in sim
+export const defaultTWAPConfig: TWAPConfig = {
+  windowSeconds: 15,
+  depegThreshold: 0.94,
+  falsePositiveTolerance: 0.02,
+};
+
+// Check if TWAP would trigger a false positive on a given series
+export function checkTWAPFalsePositive(
+  prices: HistoricalPrice[],
+  config: TWAPConfig = defaultTWAPConfig
+): boolean {
+  const twap = calculateTWAP(prices, config.windowSeconds);
+  if (twap === null) return false;
+  return twap < config.depegThreshold;
+}
+
+// Anchor program IDL fragment for vault (minimal, only what sim needs)
+export const VaultIDL = {
+  version: "0.1.0",
+  name: "vault",
+  instructions: [
+    {
+      name: "deposit",
+      accounts: [
+        { name: "vault", isMut: true, isSigner: false },
+        { name: "user", isMut: true, isSigner: true },
+        { name: "jitoMint", isMut: false, isSigner: false },
+        { name: "userToken", isMut: true, isSigner: false },
+        { name: "vaultToken", isMut: true, isSigner: false },
+        { name: "tokenProgram", isMut: false, isSigner: false },
+      ],
+      args: [{ name: "amount", type: "u64" }],
+    },
+    {
+      name: "drawdown",
+      accounts: [
+        { name: "vault", isMut: true, isSigner: false },
+        { name: "owner", isMut: false, isSigner: true },
+        { name: "protectionBuffer", isMut: true, isSigner: false },
+      ],
+      args: [],
+    },
+    {
+      name: "pause",
+      accounts: [
+        { name: "vault", isMut: true, isSigner: false },
+        { name: "owner", isMut: false, isSigner: true },
+      ],
+      args: [],
+    },
+    {
+      name: "withdrawProtected",
+      accounts: [
+        { name: "vault", isMut: true, isSigner: false },
+        { name: "owner", isMut: false, isSigner: true },
+        { name: "protectionBuffer", isMut: true, isSigner: false },
+        { name: "recipient", isMut: true, isSigner: false },
+      ],
+      args: [{ name: "amount", type: "u64" }],
+    },
+  ],
+  accounts: [
+    {
+      name: "Vault",
+      type: {
+        kind: "struct",
+        fields: [
+          { name: "owner", type: "publicKey" },
+          { name: "jitoMint", type: "publicKey" },
+          { name: "totalDeposits", type: "u64" },
+          { name: "isPaused", type: "bool" },
+          { name: "drawdownThreshold", type: "u64" },
+        ],
+      },
+    },
+    {
+      name: "ProtectionBuffer",
+      type: {
+        kind: "struct",
+        fields: [
+          { name: "balance", type: "u64" },
+          { name: "lastDrawdown", type: "i64" },
+        ],
+      },
+    },
+  ],
+} as const;
