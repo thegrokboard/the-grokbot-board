@@ -1,94 +1,119 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { OracleUtils, PriceData } from "./oracle-utils";
 
-// Minimal PriceData interface used by checker and runner (no slot, no confidence)
-export interface PriceData {
-  price: number;
+export interface JitoPricePoint {
   timestamp: number;
+  price: number;
 }
 
-export class TestOracle {
-  private prices: PriceData[] = [];
-  private lagSlots: number = 45; // target 45s lag at ~0.4s/slot
+export class LagInjector {
+  private connection: Connection;
+  private oracleUtils: OracleUtils;
+  private lagSlots: number;
+  private priceHistory: JitoPricePoint[] = [];
   private currentSlot: number = 0;
+  private baseSlot: number = 0;
 
-  constructor() {}
-
-  // Load the last three Jito depeg series (hard-coded replay data for sim)
-  loadDepegSeries(): void {
-    // Simulated recent JitoSOL depeg price series (price in USD, timestamp in seconds)
-    // Three short "depeg events" with realistic drops
-    this.prices = [
-      // Series 1: mild depeg
-      { price: 0.98, timestamp: 1000 },
-      { price: 0.95, timestamp: 1010 },
-      { price: 0.92, timestamp: 1020 },
-      { price: 0.89, timestamp: 1030 },
-      { price: 0.95, timestamp: 1040 },
-      // Series 2: sharper drop
-      { price: 0.85, timestamp: 2000 },
-      { price: 0.78, timestamp: 2015 },
-      { price: 0.72, timestamp: 2030 },
-      { price: 0.88, timestamp: 2050 },
-      // Series 3: recovery after depeg
-      { price: 0.65, timestamp: 3000 },
-      { price: 0.75, timestamp: 3020 },
-      { price: 0.92, timestamp: 3050 },
-      { price: 0.98, timestamp: 3070 },
-      { price: 1.00, timestamp: 3100 },
-    ];
+  constructor(
+    connection: Connection,
+    oracleProgramId: PublicKey,
+    lagSeconds: number = 45,
+    baseSlot: number = 0
+  ) {
+    this.connection = connection;
+    this.oracleUtils = new OracleUtils(connection, oracleProgramId);
+    this.lagSlots = Math.floor((lagSeconds * 2)); // ~2 slots per second on devnet/test
+    this.baseSlot = baseSlot;
+    this.currentSlot = baseSlot;
   }
 
-  setLag(lagSeconds: number): void {
-    this.lagSlots = Math.floor(lagSeconds / 0.4); // approximate slots
+  async loadPriceHistory(history: JitoPricePoint[]): Promise<void> {
+    this.priceHistory = [...history].sort((a, b) => a.timestamp - b.timestamp);
+    if (this.priceHistory.length > 0) {
+      this.currentSlot = this.baseSlot + Math.floor((Date.now() - this.priceHistory[0].timestamp) / 500);
+    }
   }
 
-  // Advance internal clock and return observable price at (current - lag)
-  tick(): PriceData | null {
-    this.currentSlot += 1;
-    const laggedSlot = this.currentSlot - this.lagSlots;
-    const laggedTime = laggedSlot * 0.4 + 1000; // base offset for replay
+  getCurrentSlot(): number {
+    return this.currentSlot;
+  }
 
-    // Find closest price point at or before lagged time
-    let best: PriceData | null = null;
-    for (const p of this.prices) {
-      if (p.timestamp <= laggedTime) {
-        if (!best || p.timestamp > best.timestamp) {
-          best = p;
-        }
-      } else {
-        break;
+  async advanceSlot(steps: number = 1): Promise<void> {
+    this.currentSlot += steps;
+  }
+
+  async injectLatestPrice(oracleAccount: PublicKey): Promise<void> {
+    const effectiveSlot = this.currentSlot - this.lagSlots;
+    const pricePoint = this.getPriceAtSlot(effectiveSlot);
+    if (!pricePoint) {
+      return;
+    }
+
+    const priceData: PriceData = {
+      price: pricePoint.price,
+      timestamp: new anchor.BN(pricePoint.timestamp),
+    };
+
+    await this.oracleUtils.updateOracle(oracleAccount, priceData);
+  }
+
+  private getPriceAtSlot(slot: number): JitoPricePoint | null {
+    if (this.priceHistory.length === 0) return null;
+
+    const targetTime = this.getTimestampForSlot(slot);
+    // Find closest price point
+    let closest = this.priceHistory[0];
+    let minDiff = Math.abs(closest.timestamp - targetTime);
+
+    for (const point of this.priceHistory) {
+      const diff = Math.abs(point.timestamp - targetTime);
+      if (diff < minDiff) {
+        minDiff = diff;
+        closest = point;
       }
     }
-    return best;
+    return closest;
   }
 
-  // Public API expected by tick-runner (no extra args)
-  getLatestPrice(): PriceData | null {
-    return this.tick();
+  private getTimestampForSlot(slot: number): number {
+    // Simplified mapping: assume genesis at baseSlot ~0
+    return Math.floor(Date.now() / 1000) - ((this.currentSlot - slot) * 0.5);
   }
 
-  // Compatibility alias used by older runner calls
-  injectLag(lagSeconds: number): void {
-    this.setLag(lagSeconds);
-  }
+  async replayLastThreeSeries(
+    oracleAccount: PublicKey,
+    tickIntervalMs: number = 15000
+  ): Promise<void> {
+    // Replay logic for last three known Jito depeg series (hardcoded sample for sim)
+    const sampleSeries: JitoPricePoint[] = [
+      // Series 1: minor depeg
+      { timestamp: 1720000000, price: 0.98 },
+      { timestamp: 1720000015, price: 0.97 },
+      { timestamp: 1720000030, price: 0.95 },
+      { timestamp: 1720000045, price: 0.92 },
+      { timestamp: 1720000060, price: 0.90 },
+      // Series 2: recovery
+      { timestamp: 1720100000, price: 0.89 },
+      { timestamp: 1720100015, price: 0.91 },
+      { timestamp: 1720100030, price: 0.94 },
+      { timestamp: 1720100045, price: 0.97 },
+      { timestamp: 1720100060, price: 0.99 },
+      // Series 3: severe depeg (breaker should trip)
+      { timestamp: 1720200000, price: 0.98 },
+      { timestamp: 1720200015, price: 0.85 },
+      { timestamp: 1720200030, price: 0.72 },
+      { timestamp: 1720200045, price: 0.68 },
+      { timestamp: 1720200060, price: 0.65 },
+    ];
 
-  // Reset for repeated sim runs
-  reset(): void {
-    this.currentSlot = 0;
-  }
-}
+    await this.loadPriceHistory(sampleSeries);
 
-// Utility to create a real on-chain oracle account (stubbed for local test validator)
-export async function createTestOracleAccount(
-  connection: Connection,
-  payer: anchor.web3.Keypair,
-  programId: PublicKey
-): Promise<PublicKey> {
-  // In pure-onchain sim we just return a deterministic PDA; real deployment would init here
-  const [oraclePda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("oracle"), Buffer.from("jitoSOL")],
-    programId
-  );
-  return oraclePda;
+    // Drive replay with configurable tick
+    for (let i = 0; i < 30; i++) { // simulate ~7.5 minutes of ticks
+      await this.advanceSlot(4);
+      await this.injectLatestPrice(oracleAccount);
+      await new Promise((resolve) => setTimeout(resolve, tickIntervalMs / 4));
+    }
+  }
 }
