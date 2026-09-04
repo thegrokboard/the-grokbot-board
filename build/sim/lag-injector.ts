@@ -2,81 +2,57 @@ import * as anchor from "@coral-xyz/anchor";
 import { PublicKey, Connection, Keypair } from "@solana/web3.js";
 import { OracleUtils, PriceData } from "./oracle-utils";
 
-export interface JitoPricePoint {
-  slot: number;
-  price: number; // in USD, scaled to 1e9 for precision
-  confidence: number;
-  timestamp: number;
-}
-
 export class LagInjector {
   private oracleUtils: OracleUtils;
-  private connection: Connection;
   private lagSlots: number;
-  private priceHistory: JitoPricePoint[] = [];
-  private lastInjectedSlot: number = 0;
+  private connection: Connection;
+  private programId: PublicKey;
+  private priceHistory: PriceData[] = [];
 
   constructor(
     connection: Connection,
-    oracleProgramId: PublicKey,
-    jitoFeedPubkey: PublicKey,
-    targetLagSeconds: number = 45
+    programId: PublicKey,
+    lagSeconds: number = 45
   ) {
     this.connection = connection;
-    this.oracleUtils = new OracleUtils(connection, oracleProgramId, jitoFeedPubkey);
-    this.lagSlots = Math.floor(targetLagSeconds * 2); // approx 2 slots per second on test validator
+    this.programId = programId;
+    this.lagSlots = Math.floor(lagSeconds * 2); // ~2 slots per second
+    this.oracleUtils = new OracleUtils(connection, programId);
   }
 
-  public loadPriceSeries(series: JitoPricePoint[]): void {
-    this.priceHistory = [...series].sort((a, b) => a.slot - b.slot);
-    this.lastInjectedSlot = 0;
+  async loadPriceHistory(prices: Array<{ price: number; confidence: number; timestamp: number }>): Promise<void> {
+    this.priceHistory = prices.map((p, i) => ({
+      price: p.price,
+      confidence: p.confidence,
+      timestamp: p.timestamp,
+      slot: i * 2, // simulate increasing slots
+    }));
   }
 
-  public async injectLag(currentSlot: number): Promise<void> {
-    if (this.priceHistory.length === 0) {
-      throw new Error("No price series loaded");
-    }
-
-    const targetSlot = Math.max(0, currentSlot - this.lagSlots);
-    const priceToInject = this.findPriceAtOrBefore(targetSlot);
-
-    if (!priceToInject) {
-      console.warn(`No historical price found for target slot ${targetSlot}`);
+  async injectPriceWithLag(currentSlot: number): Promise<void> {
+    const targetSlot = currentSlot - this.lagSlots;
+    if (targetSlot < 0 || this.priceHistory.length === 0) {
+      console.log(`LagInjector: no historical price for slot ${targetSlot}, using latest`);
+      const latest = this.priceHistory[this.priceHistory.length - 1];
+      if (latest) {
+        await this.oracleUtils.setPrice(latest.price, latest.confidence);
+      }
       return;
     }
 
-    if (priceToInject.slot === this.lastInjectedSlot) {
-      return; // already injected this price
-    }
-
-    const priceData: PriceData = {
-      price: priceToInject.price,
-      confidence: priceToInject.confidence,
-      timestamp: priceToInject.timestamp,
-    };
-
-    await this.oracleUtils.updatePrice(priceData);
-    this.lastInjectedSlot = priceToInject.slot;
-
-    console.log(`Injected lagged JitoSOL price at slot ${currentSlot}: $${(priceToInject.price / 1e9).toFixed(4)} (lagged from slot ${priceToInject.slot})`);
-  }
-
-  private findPriceAtOrBefore(targetSlot: number): JitoPricePoint | null {
-    let closest: JitoPricePoint | null = null;
-    for (const point of this.priceHistory) {
-      if (point.slot > targetSlot) break;
-      if (!closest || point.slot > closest.slot) {
-        closest = point;
+    // find closest price by slot
+    let best = this.priceHistory[0];
+    for (const p of this.priceHistory) {
+      if (Math.abs(p.slot - targetSlot) < Math.abs(best.slot - targetSlot)) {
+        best = p;
       }
     }
-    return closest;
+
+    console.log(`LagInjector: injecting lagged price ${best.price} (slot ${best.slot}) at current slot ${currentSlot}`);
+    await this.oracleUtils.setPrice(best.price, best.confidence);
   }
 
-  public getCurrentLagSlots(): number {
+  getCurrentLagSlots(): number {
     return this.lagSlots;
-  }
-
-  public setLagSlots(slots: number): void {
-    this.lagSlots = slots;
   }
 }
