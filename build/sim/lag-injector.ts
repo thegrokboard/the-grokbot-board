@@ -1,75 +1,63 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Keypair, Connection } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair } from "@solana/web3.js";
 import { OracleUtils, PriceData } from "./oracle-utils";
 
 export interface LagInjectorConfig {
-  oraclePubkey: PublicKey;
   lagSlots: number;
-  replaySeries: PriceData[];
+  oraclePubkey: PublicKey;
+  payer: Keypair;
 }
 
 export class LagInjector {
+  private connection: Connection;
   private oracleUtils: OracleUtils;
   private lagSlots: number;
-  private replaySeries: PriceData[];
-  private currentIndex: number = 0;
-  private connection: Connection;
+  private priceHistory: PriceData[] = [];
+  private oraclePubkey: PublicKey;
   private payer: Keypair;
 
-  constructor(config: LagInjectorConfig, connection: Connection, payer: Keypair) {
-    this.oracleUtils = new OracleUtils(config.oraclePubkey, connection);
-    this.lagSlots = config.lagSlots;
-    this.replaySeries = [...config.replaySeries];
+  constructor(connection: Connection, config: LagInjectorConfig) {
     this.connection = connection;
-    this.payer = payer;
+    this.lagSlots = config.lagSlots;
+    this.oraclePubkey = config.oraclePubkey;
+    this.payer = config.payer;
+    this.oracleUtils = new OracleUtils(connection, config.oraclePubkey);
   }
 
-  async injectLag(currentSlot: number): Promise<void> {
-    if (this.currentIndex >= this.replaySeries.length) {
-      this.currentIndex = 0; // loop for repeated testing
+  async loadPriceHistory(prices: PriceData[]): Promise<void> {
+    this.priceHistory = [...prices];
+  }
+
+  async injectNextPrice(currentSlot: number): Promise<void> {
+    const effectiveSlot = currentSlot - this.lagSlots;
+    const priceToInject = this.priceHistory.find(p => p.slot <= effectiveSlot);
+    if (!priceToInject) {
+      console.warn(`No price data available for slot ${effectiveSlot}`);
+      return;
     }
 
-    const priceData = this.replaySeries[this.currentIndex];
-    const targetSlot = currentSlot - this.lagSlots;
-
-    // Update oracle with lagged price (OracleUtils.setPrice handles slot internally via recent blockhash)
-    await this.oracleUtils.setPrice(
-      priceData.price,
-      priceData.confidence,
-      this.payer
-    );
-
-    this.currentIndex++;
+    await this.oracleUtils.setPrice(priceToInject.price, this.payer);
+    console.log(`Injected lagged price ${priceToInject.price} at slot ${currentSlot} (effective ${effectiveSlot})`);
   }
 
-  getCurrentPrice(): number {
-    if (this.replaySeries.length === 0) return 0;
-    const idx = Math.max(0, this.currentIndex - 1);
-    return this.replaySeries[idx].price;
+  getCurrentLag(): number {
+    return this.lagSlots;
   }
 
-  reset(): void {
-    this.currentIndex = 0;
-  }
-
-  // For test compatibility - matches audited export expectations
-  setPrice(price: number, confidence: number = 0.01): Promise<void> {
-    return this.oracleUtils.setPrice(price, confidence, this.payer);
+  setLag(newLag: number): void {
+    this.lagSlots = newLag;
   }
 }
 
-// Convenience factory matching expected usage pattern
-export async function createLagInjector(
-  oraclePubkey: PublicKey,
-  lagSlots: number,
-  replaySeries: PriceData[],
+// Export the exact function signature expected by tick-runner
+export async function replayWithLag(
   connection: Connection,
+  prices: PriceData[],
+  lagSlots: number,
+  oraclePubkey: PublicKey,
   payer: Keypair
 ): Promise<LagInjector> {
-  const config: LagInjectorConfig = {
-    oraclePubkey,
-    lagSlots,
-    replaySeries,
-  };
-  return new LagInjector(config, connection, payer);
+  const injector = new LagInjector(connection, { lagSlots, oraclePubkey, payer });
+  await injector.loadPriceHistory(prices);
+  return injector;
 }
