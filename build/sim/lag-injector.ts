@@ -1,68 +1,112 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { PublicKey, Connection, Keypair, Transaction, SystemProgram } from "@solana/web3.js";
 import { getHistoricalJitoPrices, PriceData, HistoricalPriceSeries } from "./oracle-utils";
+import { TWAPConfig } from "./twap-checker";
 
 export interface LagInjectorConfig {
   lagSlots: number;
   oraclePubkey: PublicKey;
-  jitoSolMint: PublicKey;
+  payer: Keypair;
+  connection: Connection;
+  programId: PublicKey;
 }
 
 export class LagInjector {
-  private connection: Connection;
   private config: LagInjectorConfig;
-  private series: HistoricalPriceSeries = [];
-  private currentIndex: number = 0;
-  private slotOffset: number = 0;
+  private priceHistory: PriceData[] = [];
+  private currentSlot = 0;
+  private lastInjectedSlot = 0;
 
-  constructor(connection: Connection, config: LagInjectorConfig) {
-    this.connection = connection;
+  constructor(config: LagInjectorConfig) {
     this.config = config;
-    this.slotOffset = config.lagSlots;
+    this.priceHistory = [];
   }
 
-  async loadSeries(): Promise<void> {
-    this.series = await getHistoricalJitoPrices();
-    this.currentIndex = 0;
-    console.log(`Loaded ${this.series.length} historical JitoSOL price points for lag simulation`);
+  async loadHistoricalData(): Promise<void> {
+    const series: HistoricalPriceSeries = await getHistoricalJitoPrices();
+    this.priceHistory = series.map((p: any) => ({
+      price: p.price,
+      confidence: p.confidence || 0.01,
+      timestamp: p.timestamp,
+      slot: p.slot || Math.floor(p.timestamp / 0.4), // approximate slot from timestamp if missing
+    }));
+    this.currentSlot = Math.max(...this.priceHistory.map(p => p.slot));
+    this.lastInjectedSlot = this.currentSlot - this.config.lagSlots * 3; // start with buffer
   }
 
-  getCurrentPriceData(currentSlot: number): PriceData | null {
-    if (this.series.length === 0) return null;
-
-    const laggedSlot = Math.max(0, currentSlot - this.slotOffset);
-    let index = this.series.findIndex(p => p.slot >= laggedSlot);
-    if (index === -1) index = this.series.length - 1;
-    if (index >= this.series.length) index = this.series.length - 1;
-
-    const data = this.series[index];
-    return {
-      price: data.price,
-      confidence: data.confidence,
-      timestamp: data.timestamp,
-    };
-  }
-
-  async injectPrice(currentSlot: number, oraclePubkey?: PublicKey): Promise<void> {
-    const priceData = this.getCurrentPriceData(currentSlot);
-    if (!priceData) {
-      console.warn("No price data available for injection");
-      return;
+  async injectLag(targetLagSeconds: number = 45): Promise<void> {
+    if (this.priceHistory.length === 0) {
+      await this.loadHistoricalData();
     }
 
-    const targetOracle = oraclePubkey || this.config.oraclePubkey;
-    console.log(`[LagInjector] Slot ${currentSlot} (lagged ~${this.slotOffset} slots): injecting price=${priceData.price} confidence=${priceData.confidence} ts=${priceData.timestamp} to ${targetOracle.toBase58()}`);
+    const lagSlots = Math.floor(targetLagSeconds / 0.4); // ~400ms per slot
+    const effectiveLag = Math.max(lagSlots, this.config.lagSlots);
 
-    // In test-validator sim we log; real injection would use a mock oracle account update
-    // For pure-onchain harness this drives the TWAP checker against delayed feed
-    this.currentIndex = Math.min(this.currentIndex + 1, this.series.length - 1);
+    // Replay last 3 depeg events with lag
+    const depegEvents = this.detectDepegEvents();
+    for (const event of depegEvents) {
+      const laggedSlot = event.slot + effectiveLag;
+      await this.updateOracleAtSlot(laggedSlot, event.price, event.confidence);
+      this.lastInjectedSlot = Math.max(this.lastInjectedSlot, laggedSlot);
+    }
+
+    // Advance to current simulated slot
+    this.currentSlot = this.lastInjectedSlot + 50; // small buffer
   }
 
-  reset(): void {
-    this.currentIndex = 0;
+  private detectDepegEvents(): PriceData[] {
+    const events: PriceData[] = [];
+    let inDepeg = false;
+    for (let i = 1; i < this.priceHistory.length; i++) {
+      const prev = this.priceHistory[i - 1];
+      const curr = this.priceHistory[i];
+      const drop = (prev.price - curr.price) / prev.price;
+      if (drop > 0.02 && !inDepeg) { // 2%+ drop
+        inDepeg = true;
+        events.push(curr);
+      } else if (drop < 0.005) {
+        inDepeg = false;
+      }
+      if (events.length >= 3) break;
+    }
+    return events.length > 3 ? events.slice(-3) : events;
   }
 
-  getSeriesLength(): number {
-    return this.series.length;
+  private async updateOracleAtSlot(slot: number, price: number, confidence: number): Promise<void> {
+    // Simulate oracle update by sending a transaction that would update a mock Switchboard-like account
+    // In real test validator this would CPI or directly write to oracle account; here we just advance slot and log
+    this.currentSlot = Math.max(this.currentSlot, slot);
+
+    const recentBlockhash = (await this.config.connection.getLatestBlockhash()).blockhash;
+    const tx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: this.config.payer.publicKey,
+        toPubkey: this.config.payer.publicKey,
+        lamports: 1, // no-op to advance slot with timestamp hint
+      })
+    );
+    tx.recentBlockhash = recentBlockhash;
+    tx.feePayer = this.config.payer.publicKey;
+    await anchor.web3.sendAndConfirmTransaction(this.config.connection, tx, [this.config.payer], {
+      commitment: "confirmed",
+      skipPreflight: true,
+    });
+
+    // In full harness this would also update a mock oracle account with the lagged price
+    console.log(`[LagInjector] Injected lagged price at slot ${slot}: $${price.toFixed(4)} (lag ~${Math.round((slot - (this.priceHistory.find(p => p.price === price)?.slot || 0)) * 0.4)}s)`);
+  }
+
+  getCurrentSlot(): number {
+    return this.currentSlot;
+  }
+
+  getLastInjectedPrice(): PriceData | null {
+    if (this.priceHistory.length === 0) return null;
+    return this.priceHistory[this.priceHistory.length - 1];
+  }
+
+  // Public API used by tick-runner
+  async simulateLag(targetLagSeconds: number = 45): Promise<void> {
+    await this.injectLag(targetLagSeconds);
   }
 }
