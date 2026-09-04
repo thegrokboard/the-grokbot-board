@@ -1,71 +1,82 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Keypair, Connection, Transaction, SystemProgram } from "@solana/web3.js";
+import { PublicKey, Connection, Keypair } from "@solana/web3.js";
 import { OracleUtils, PriceData } from "./oracle-utils";
 
+export interface JitoPricePoint {
+  slot: number;
+  price: number; // in USD, scaled to 1e9 for precision
+  confidence: number;
+  timestamp: number;
+}
+
 export class LagInjector {
-  private connection: Connection;
   private oracleUtils: OracleUtils;
+  private connection: Connection;
   private lagSlots: number;
-  private jitoPriceFeed: PublicKey;
-  private programId: PublicKey;
+  private priceHistory: JitoPricePoint[] = [];
+  private lastInjectedSlot: number = 0;
 
   constructor(
     connection: Connection,
-    oracleUtils: OracleUtils,
-    lagSeconds: number = 45,
-    jitoPriceFeed: PublicKey,
-    programId: PublicKey
+    oracleProgramId: PublicKey,
+    jitoFeedPubkey: PublicKey,
+    targetLagSeconds: number = 45
   ) {
     this.connection = connection;
-    this.oracleUtils = oracleUtils;
-    this.lagSlots = Math.floor((lagSeconds * 2)); // rough 0.5s per slot
-    this.jitoPriceFeed = jitoPriceFeed;
-    this.programId = programId;
+    this.oracleUtils = new OracleUtils(connection, oracleProgramId, jitoFeedPubkey);
+    this.lagSlots = Math.floor(targetLagSeconds * 2); // approx 2 slots per second on test validator
   }
 
-  async injectLag(currentSlot: number, historicalPrices: Array<{price: number; timestamp: number}>): Promise<void> {
-    const laggedSlot = Math.max(0, currentSlot - this.lagSlots);
-    
-    // Replay last three prices with lag
-    for (let i = 0; i < Math.min(3, historicalPrices.length); i++) {
-      const entry = historicalPrices[historicalPrices.length - 1 - i];
-      const priceData: PriceData = {
-        price: entry.price,
-        confidence: 0.01, // 1% confidence
-        slot: laggedSlot - i * 4, // spread across slots
-        timestamp: new anchor.BN(entry.timestamp)
-      };
-      
-      await this.oracleUtils.updateOracle(
-        this.jitoPriceFeed,
-        priceData,
-        this.programId
-      );
+  public loadPriceSeries(series: JitoPricePoint[]): void {
+    this.priceHistory = [...series].sort((a, b) => a.slot - b.slot);
+    this.lastInjectedSlot = 0;
+  }
+
+  public async injectLag(currentSlot: number): Promise<void> {
+    if (this.priceHistory.length === 0) {
+      throw new Error("No price series loaded");
     }
-  }
 
-  async replaySeries(series: Array<{price: number; timestamp: number}>, startSlot: number): Promise<void> {
-    let slot = startSlot;
-    for (let i = 0; i < series.length; i++) {
-      const entry = series[series.length - 1 - i];
-      const priceData: PriceData = {
-        price: entry.price,
-        confidence: 0.005,
-        slot: slot,
-        timestamp: new anchor.BN(entry.timestamp)
-      };
-      
-      await this.oracleUtils.updateOracle(
-        this.jitoPriceFeed,
-        priceData,
-        this.programId
-      );
-      
-      slot -= 2; // advance backwards in simulation
+    const targetSlot = Math.max(0, currentSlot - this.lagSlots);
+    const priceToInject = this.findPriceAtOrBefore(targetSlot);
+
+    if (!priceToInject) {
+      console.warn(`No historical price found for target slot ${targetSlot}`);
+      return;
     }
+
+    if (priceToInject.slot === this.lastInjectedSlot) {
+      return; // already injected this price
+    }
+
+    const priceData: PriceData = {
+      price: priceToInject.price,
+      confidence: priceToInject.confidence,
+      timestamp: priceToInject.timestamp,
+    };
+
+    await this.oracleUtils.updatePrice(priceData);
+    this.lastInjectedSlot = priceToInject.slot;
+
+    console.log(`Injected lagged JitoSOL price at slot ${currentSlot}: $${(priceToInject.price / 1e9).toFixed(4)} (lagged from slot ${priceToInject.slot})`);
   }
 
-  getLagSlots(): number {
+  private findPriceAtOrBefore(targetSlot: number): JitoPricePoint | null {
+    let closest: JitoPricePoint | null = null;
+    for (const point of this.priceHistory) {
+      if (point.slot > targetSlot) break;
+      if (!closest || point.slot > closest.slot) {
+        closest = point;
+      }
+    }
+    return closest;
+  }
+
+  public getCurrentLagSlots(): number {
     return this.lagSlots;
+  }
+
+  public setLagSlots(slots: number): void {
+    this.lagSlots = slots;
   }
 }
