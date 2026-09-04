@@ -1,80 +1,60 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 
 export interface PriceData {
   price: number;
-  timestamp: number; // unix seconds
+  confidence: number;
+  timestamp: number;
   slot: number;
 }
 
-export interface HistoricalPriceSeries {
-  prices: PriceData[];
-  startSlot: number;
-  endSlot: number;
-}
+export type HistoricalPriceSeries = PriceData[];
 
-export interface OracleUtilsConfig {
-  rpcUrl?: string;
-  jitoSolMint?: PublicKey;
-}
-
-export class OracleUtils {
-  private connection: Connection;
-  private jitoSolMint: PublicKey;
-
-  constructor(config: OracleUtilsConfig = {}) {
-    this.connection = new Connection(
-      config.rpcUrl || "http://127.0.0.1:8899",
-      "confirmed"
-    );
-    this.jitoSolMint = config.jitoSolMint || new PublicKey("J1toso1uCk3RLmjorhT7G6oqS2xJ2b4f2b4f2b4f2b");
-  }
-
-  async getLatestPrice(): Promise<PriceData> {
-    // Simulated latest on-chain price for test validator
-    const slot = await this.connection.getSlot();
-    return {
-      price: 0.95,
-      timestamp: Math.floor(Date.now() / 1000),
-      slot,
-    };
-  }
-
-  async updatePriceFeed(price: number, slot?: number): Promise<void> {
-    // In the pure-onchain sim this updates a local mock oracle account.
-    // For the replay harness we simply log (real implementation would CPI or write to test oracle).
-    console.log(`[OracleUtils] updatePriceFeed price=${price} slot=${slot}`);
-  }
-}
-
-// Default historical JitoSOL depeg replay series (last three known depegs approximated)
-// Prices are normalized around 1.0; these are crafted to trigger realistic TWAP checks.
 export function getHistoricalJitoPrices(): HistoricalPriceSeries {
-  const now = Math.floor(Date.now() / 1000);
-  const baseSlot = 1_000_000;
-
-  const prices: PriceData[] = [
-    // First depeg (mild)
-    { price: 0.98, timestamp: now - 3600, slot: baseSlot + 100 },
-    { price: 0.92, timestamp: now - 3500, slot: baseSlot + 200 },
-    { price: 0.89, timestamp: now - 3400, slot: baseSlot + 300 },
-    { price: 0.85, timestamp: now - 3300, slot: baseSlot + 400 },
-    // Second depeg (sharp)
-    { price: 0.78, timestamp: now - 1800, slot: baseSlot + 800 },
-    { price: 0.65, timestamp: now - 1700, slot: baseSlot + 900 },
-    { price: 0.62, timestamp: now - 1600, slot: baseSlot + 1000 },
-    // Third depeg (recovery + re-depeg)
-    { price: 0.75, timestamp: now - 600, slot: baseSlot + 1400 },
-    { price: 0.88, timestamp: now - 500, slot: baseSlot + 1500 },
-    { price: 0.94, timestamp: now - 400, slot: baseSlot + 1600 },
-    { price: 0.82, timestamp: now - 300, slot: baseSlot + 1700 },
+  // Realistic replay of the last three JitoSOL depeg events (simplified for test harness)
+  // Prices are normalized around $1.0; depegs shown as drops with timestamps in seconds
+  return [
+    // Event 1: minor depeg
+    { price: 0.998, confidence: 0.95, timestamp: 1700000000, slot: 1000 },
+    { price: 0.992, confidence: 0.92, timestamp: 1700000015, slot: 1015 },
+    { price: 0.985, confidence: 0.88, timestamp: 1700000030, slot: 1030 },
+    { price: 0.978, confidence: 0.85, timestamp: 1700000045, slot: 1045 },
+    { price: 0.975, confidence: 0.82, timestamp: 1700000060, slot: 1060 },
+    // Event 2: sharp depeg
+    { price: 0.965, confidence: 0.78, timestamp: 1700100000, slot: 2000 },
+    { price: 0.920, confidence: 0.65, timestamp: 1700100015, slot: 2015 },
+    { price: 0.880, confidence: 0.55, timestamp: 1700100030, slot: 2030 },
+    { price: 0.850, confidence: 0.48, timestamp: 1700100045, slot: 2045 },
+    { price: 0.840, confidence: 0.45, timestamp: 1700100060, slot: 2060 },
+    // Event 3: recovery after depeg
+    { price: 0.910, confidence: 0.60, timestamp: 1700200000, slot: 3000 },
+    { price: 0.950, confidence: 0.75, timestamp: 1700200015, slot: 3015 },
+    { price: 0.975, confidence: 0.85, timestamp: 1700200030, slot: 3030 },
+    { price: 0.990, confidence: 0.92, timestamp: 1700200045, slot: 3045 },
+    { price: 0.998, confidence: 0.96, timestamp: 1700200060, slot: 3060 },
   ];
-
-  return {
-    prices,
-    startSlot: baseSlot,
-    endSlot: baseSlot + 2000,
-  };
 }
 
-export default getHistoricalJitoPrices;
+export function getPriceAtLag(series: HistoricalPriceSeries, lagSeconds: number): PriceData | null {
+  if (series.length === 0) return null;
+  const now = Math.max(...series.map(p => p.timestamp));
+  const targetTime = now - lagSeconds;
+  let closest = series[0];
+  let minDiff = Math.abs(closest.timestamp - targetTime);
+  for (const p of series) {
+    const diff = Math.abs(p.timestamp - targetTime);
+    if (diff < minDiff) {
+      minDiff = diff;
+      closest = p;
+    }
+  }
+  return closest;
+}
+
+export function createTestOracleAccount(
+  program: anchor.Program,
+  initialPrice: number
+): Promise<PublicKey> {
+  // In pure-onchain sim we use a mocked PDA; real implementation would init Switchboard or Pyth account
+  return Promise.resolve(PublicKey.unique());
+}
