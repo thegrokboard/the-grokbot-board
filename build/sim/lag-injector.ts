@@ -1,63 +1,87 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { PublicKey, Connection, Keypair } from "@solana/web3.js";
 import { OracleUtils, PriceData } from "./oracle-utils";
 
 export interface LagInjectorConfig {
+  oracleProgramId: PublicKey;
+  priceFeed: PublicKey;
   lagSlots: number;
-  oraclePubkey: PublicKey;
-  payer: Keypair;
+  rpcUrl?: string;
 }
 
 export class LagInjector {
   private connection: Connection;
   private oracleUtils: OracleUtils;
-  private lagSlots: number;
+  private config: LagInjectorConfig;
   private priceHistory: PriceData[] = [];
-  private oraclePubkey: PublicKey;
-  private payer: Keypair;
+  private currentSlot = 0;
 
-  constructor(connection: Connection, config: LagInjectorConfig) {
-    this.connection = connection;
-    this.lagSlots = config.lagSlots;
-    this.oraclePubkey = config.oraclePubkey;
-    this.payer = config.payer;
-    this.oracleUtils = new OracleUtils(connection, config.oraclePubkey);
+  constructor(config: LagInjectorConfig) {
+    this.config = config;
+    this.connection = new Connection(config.rpcUrl || "http://127.0.0.1:8899", "confirmed");
+    this.oracleUtils = new OracleUtils(this.connection, config.oracleProgramId);
   }
 
   async loadPriceHistory(prices: PriceData[]): Promise<void> {
     this.priceHistory = [...prices];
+    this.currentSlot = 0;
+    console.log(`Loaded ${this.priceHistory.length} historical prices for lag replay`);
   }
 
-  async injectNextPrice(currentSlot: number): Promise<void> {
-    const effectiveSlot = currentSlot - this.lagSlots;
-    const priceToInject = this.priceHistory.find(p => p.slot <= effectiveSlot);
-    if (!priceToInject) {
-      console.warn(`No price data available for slot ${effectiveSlot}`);
-      return;
-    }
-
-    await this.oracleUtils.setPrice(priceToInject.price, this.payer);
-    console.log(`Injected lagged price ${priceToInject.price} at slot ${currentSlot} (effective ${effectiveSlot})`);
+  async advanceSlot(slots: number = 1): Promise<void> {
+    this.currentSlot += slots;
+    await this.injectLag();
   }
 
-  getCurrentLag(): number {
-    return this.lagSlots;
+  async injectLag(): Promise<void> {
+    if (this.priceHistory.length === 0) return;
+
+    // Calculate lagged index: lagSlots behind current simulated slot
+    const lagIndex = Math.max(0, this.currentSlot - this.config.lagSlots);
+    const effectiveIndex = Math.min(lagIndex, this.priceHistory.length - 1);
+    const laggedPrice = this.priceHistory[effectiveIndex];
+
+    console.log(`[LagInjector] Slot ${this.currentSlot} | lag=${this.config.lagSlots} | using price from slot ~${effectiveIndex} = ${laggedPrice.price}`);
+
+    // Update on-chain oracle with the lagged price
+    await this.oracleUtils.setPrice(this.config.priceFeed, laggedPrice.price, laggedPrice.confidence, this.currentSlot);
   }
 
-  setLag(newLag: number): void {
-    this.lagSlots = newLag;
+  getCurrentLagPrice(): number {
+    if (this.priceHistory.length === 0) return 1.0;
+    const lagIndex = Math.max(0, this.currentSlot - this.config.lagSlots);
+    const effectiveIndex = Math.min(lagIndex, this.priceHistory.length - 1);
+    return this.priceHistory[effectiveIndex].price;
   }
-}
 
-// Export the exact function signature expected by tick-runner
-export async function replayWithLag(
-  connection: Connection,
-  prices: PriceData[],
-  lagSlots: number,
-  oraclePubkey: PublicKey,
-  payer: Keypair
-): Promise<LagInjector> {
-  const injector = new LagInjector(connection, { lagSlots, oraclePubkey, payer });
-  await injector.loadPriceHistory(prices);
-  return injector;
+  async replayLastThreeDepegs(): Promise<void> {
+    // Simulated JitoSOL depeg series (price, confidence). Real data would be loaded from JSON.
+    const depegSeries: PriceData[] = [
+      // Stable period
+      { price: 1.00, confidence: 0.001, slot: 100 },
+      { price: 1.00, confidence: 0.001, slot: 110 },
+      { price: 0.999, confidence: 0.002, slot: 120 },
+      // First depeg (flash crash to ~0.92)
+      { price: 0.98, confidence: 0.01, slot: 200 },
+      { price: 0.94, confidence: 0.03, slot: 210 },
+      { price: 0.92, confidence: 0.05, slot: 220 },
+      { price: 0.93, confidence: 0.04, slot: 230 },
+      // Recovery
+      { price: 0.96, confidence: 0.02, slot: 240 },
+      { price: 0.99, confidence: 0.005, slot: 250 },
+      // Second depeg
+      { price: 0.97, confidence: 0.015, slot: 300 },
+      { price: 0.89, confidence: 0.08, slot: 310 },
+      { price: 0.85, confidence: 0.12, slot: 320 },
+      { price: 0.88, confidence: 0.09, slot: 330 },
+      // Third (milder) depeg used for false-positive testing
+      { price: 0.975, confidence: 0.008, slot: 400 },
+      { price: 0.96, confidence: 0.012, slot: 410 },
+      { price: 0.955, confidence: 0.018, slot: 420 },
+      { price: 0.97, confidence: 0.006, slot: 430 },
+    ];
+
+    await this.loadPriceHistory(depegSeries);
+    console.log("Replaying last three JitoSOL depeg events with configurable oracle lag");
+  }
 }
