@@ -1,68 +1,71 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection } from "@solana/web3.js";
+import { PublicKey, Keypair, Connection, Transaction, SystemProgram } from "@solana/web3.js";
 import { OracleUtils, PriceData } from "./oracle-utils";
-
-export interface HistoricalPrice {
-  price: number;
-  confidence: number;
-  timestamp: number;
-}
 
 export class LagInjector {
   private connection: Connection;
   private oracleUtils: OracleUtils;
   private lagSlots: number;
-  private priceHistory: HistoricalPrice[] = [];
-  private currentSlot: number = 0;
+  private jitoPriceFeed: PublicKey;
+  private programId: PublicKey;
 
-  constructor(connection: Connection, oracleUtils: OracleUtils, lagSeconds: number = 45) {
+  constructor(
+    connection: Connection,
+    oracleUtils: OracleUtils,
+    lagSeconds: number = 45,
+    jitoPriceFeed: PublicKey,
+    programId: PublicKey
+  ) {
     this.connection = connection;
     this.oracleUtils = oracleUtils;
-    // Approximate slots per second on test validator (2 slots/sec is common)
-    this.lagSlots = Math.floor(lagSeconds * 2);
+    this.lagSlots = Math.floor((lagSeconds * 2)); // rough 0.5s per slot
+    this.jitoPriceFeed = jitoPriceFeed;
+    this.programId = programId;
   }
 
-  async loadHistoricalPrices(prices: HistoricalPrice[]): Promise<void> {
-    this.priceHistory = [...prices].sort((a, b) => a.timestamp - b.timestamp);
-    if (this.priceHistory.length > 0) {
-      this.currentSlot = Math.floor(this.priceHistory[0].timestamp / 0.4); // rough inverse of 2.5s/slot
+  async injectLag(currentSlot: number, historicalPrices: Array<{price: number; timestamp: number}>): Promise<void> {
+    const laggedSlot = Math.max(0, currentSlot - this.lagSlots);
+    
+    // Replay last three prices with lag
+    for (let i = 0; i < Math.min(3, historicalPrices.length); i++) {
+      const entry = historicalPrices[historicalPrices.length - 1 - i];
+      const priceData: PriceData = {
+        price: entry.price,
+        confidence: 0.01, // 1% confidence
+        slot: laggedSlot - i * 4, // spread across slots
+        timestamp: new anchor.BN(entry.timestamp)
+      };
+      
+      await this.oracleUtils.updateOracle(
+        this.jitoPriceFeed,
+        priceData,
+        this.programId
+      );
     }
   }
 
-  async advanceToSlot(targetSlot: number): Promise<void> {
-    this.currentSlot = targetSlot;
-    // Replay any prices that should be visible now (accounting for lag)
-    const visibleSlot = targetSlot - this.lagSlots;
-    const visibleTime = visibleSlot * 0.4; // approximate ms per slot
-
-    for (const price of this.priceHistory) {
-      if (price.timestamp <= visibleTime) {
-        const pd: PriceData = {
-          price: price.price,
-          timestamp: new anchor.BN(price.timestamp),
-        };
-        await this.oracleUtils.updateOracle(pd);
-      } else {
-        break;
-      }
+  async replaySeries(series: Array<{price: number; timestamp: number}>, startSlot: number): Promise<void> {
+    let slot = startSlot;
+    for (let i = 0; i < series.length; i++) {
+      const entry = series[series.length - 1 - i];
+      const priceData: PriceData = {
+        price: entry.price,
+        confidence: 0.005,
+        slot: slot,
+        timestamp: new anchor.BN(entry.timestamp)
+      };
+      
+      await this.oracleUtils.updateOracle(
+        this.jitoPriceFeed,
+        priceData,
+        this.programId
+      );
+      
+      slot -= 2; // advance backwards in simulation
     }
   }
 
-  getCurrentSlot(): number {
-    return this.currentSlot;
-  }
-
-  async injectLag(price: number, confidence: number = 1.0): Promise<void> {
-    const now = Date.now();
-    const slotTime = this.currentSlot * 0.4 * 1000;
-    const ts = Math.floor(slotTime / 1000);
-
-    const pd: PriceData = {
-      price: price,
-      timestamp: new anchor.BN(ts),
-    };
-
-    await this.oracleUtils.updateOracle(pd);
-    this.priceHistory.push({ price, confidence, timestamp: ts });
+  getLagSlots(): number {
+    return this.lagSlots;
   }
 }
