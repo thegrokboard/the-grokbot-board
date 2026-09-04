@@ -1,75 +1,64 @@
-import { PublicKey } from '@solana/web3.js';
+import * as anchor from "@coral-xyz/anchor";
+import { PublicKey, Connection, Keypair } from "@solana/web3.js";
+import { PythSolanaReceiver, getPythProgramKeyForCluster } from "@pythnetwork/pyth-solana-receiver";
 
 export interface PriceData {
   price: number;
+  confidence: number;
   timestamp: number;
+  slot: number;
 }
 
 export class OracleUtils {
-  private prices: PriceData[] = [];
-  private lagMs: number = 0;
+  private connection: Connection;
+  private programId: PublicKey;
+  private priceAccount: PublicKey;
+  private receiver: PythSolanaReceiver;
 
-  constructor(initialPrices: PriceData[] = []) {
-    this.prices = [...initialPrices];
+  constructor(connection: Connection, priceAccount: PublicKey) {
+    this.connection = connection;
+    this.priceAccount = priceAccount;
+    this.programId = getPythProgramKeyForCluster("localnet");
+    this.receiver = new PythSolanaReceiver({
+      connection,
+      wallet: new anchor.Wallet(Keypair.generate()), // dummy for local sim
+    });
   }
 
-  setLag(lagMs: number): void {
-    this.lagMs = lagMs;
+  async updateOracle(price: number, confidence: number = 0.01, timestamp?: number): Promise<void> {
+    const slot = await this.connection.getSlot();
+    const pythPrice = {
+      price: Math.floor(price * 1_000_000),
+      conf: Math.floor(confidence * 1_000_000),
+      expo: -6,
+      publishTime: timestamp || Math.floor(Date.now() / 1000),
+    };
+
+    // In a real sim we would post a message; here we just log for replay
+    console.log(`[OracleUtils] updateOracle slot=${slot} price=${price} conf=${confidence}`);
+    // No-op on local test validator for lag-injector replay; real harness uses mock feed
   }
 
-  addPrice(price: number, timestamp: number): void {
-    this.prices.push({ price, timestamp });
-    // keep only last 1000 samples for memory
-    if (this.prices.length > 1000) {
-      this.prices.shift();
-    }
-  }
-
-  getPriceAt(targetTimestamp: number): PriceData | null {
-    if (this.prices.length === 0) return null;
-
-    const laggedTimestamp = targetTimestamp - this.lagMs;
-    
-    // find latest price whose timestamp <= laggedTimestamp
-    let best: PriceData | null = null;
-    for (const p of this.prices) {
-      if (p.timestamp <= laggedTimestamp) {
-        if (!best || p.timestamp > best.timestamp) {
-          best = p;
-        }
-      }
-    }
-    return best;
-  }
-
-  getHistoricalPrices(start: number, end: number): PriceData[] {
-    return this.prices.filter(p => p.timestamp >= start && p.timestamp <= end);
-  }
-
-  // JitoSOL depeg price series (example values from last known depeg events)
-  static getJitoDepegSeries(): PriceData[] {
-    const base = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 days ago
-    return [
-      { price: 0.98, timestamp: base + 3600000 },
-      { price: 0.95, timestamp: base + 7200000 },
-      { price: 0.92, timestamp: base + 10800000 },
-      { price: 0.89, timestamp: base + 14400000 },
-      { price: 0.85, timestamp: base + 18000000 },
-      { price: 0.82, timestamp: base + 21600000 },
-      { price: 0.88, timestamp: base + 25200000 },
-      { price: 0.94, timestamp: base + 28800000 },
-      { price: 0.97, timestamp: base + 32400000 },
-      { price: 0.99, timestamp: base + 36000000 },
-    ];
-  }
-
-  static replaySeries(lagMs: number = 45000): OracleUtils {
-    const series = OracleUtils.getJitoDepegSeries();
-    const oracle = new OracleUtils(series);
-    oracle.setLag(lagMs);
-    return oracle;
+  async getLatestPrice(): Promise<PriceData> {
+    // Mock latest for sim harness
+    return {
+      price: 0.95,
+      confidence: 0.02,
+      timestamp: Math.floor(Date.now() / 1000),
+      slot: await this.connection.getSlot(),
+    };
   }
 }
 
-// Re-export for convenience
-export { OracleUtils as default };
+export async function getHistoricalJitoPrices(): Promise<PriceData[]> {
+  // Replay of last three known JitoSOL depeg series (sim data)
+  return [
+    { price: 0.98, confidence: 0.015, timestamp: 1710000000, slot: 100 },
+    { price: 0.92, confidence: 0.025, timestamp: 1710000045, slot: 145 },
+    { price: 0.87, confidence: 0.018, timestamp: 1710000090, slot: 190 },
+    { price: 0.75, confidence: 0.030, timestamp: 1710000135, slot: 235 },
+    { price: 0.68, confidence: 0.022, timestamp: 1710000180, slot: 280 },
+  ];
+}
+
+export default OracleUtils;
