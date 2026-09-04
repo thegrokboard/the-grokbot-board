@@ -1,87 +1,91 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection, Keypair } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import { OracleUtils, PriceData } from "./oracle-utils";
+import { getHistoricalJitoPrices } from "./oracle-utils";
 
 export interface LagInjectorConfig {
+  lagSeconds: number;
+  startSlot?: number;
   oracleProgramId: PublicKey;
   priceFeed: PublicKey;
-  lagSlots: number;
-  rpcUrl?: string;
 }
 
 export class LagInjector {
   private connection: Connection;
   private oracleUtils: OracleUtils;
-  private config: LagInjectorConfig;
-  private priceHistory: PriceData[] = [];
-  private currentSlot = 0;
+  private lagSeconds: number;
+  private historicalPrices: PriceData[] = [];
+  private startSlot: number = 0;
+  private currentIndex: number = 0;
+  private oracleProgramId: PublicKey;
+  private priceFeed: PublicKey;
 
-  constructor(config: LagInjectorConfig) {
-    this.config = config;
-    this.connection = new Connection(config.rpcUrl || "http://127.0.0.1:8899", "confirmed");
-    this.oracleUtils = new OracleUtils(this.connection, config.oracleProgramId);
+  constructor(config: LagInjectorConfig, connection: Connection) {
+    this.connection = connection;
+    this.lagSeconds = config.lagSeconds;
+    this.oracleProgramId = config.oracleProgramId;
+    this.priceFeed = config.priceFeed;
+    this.oracleUtils = new OracleUtils(connection, config.oracleProgramId);
+    this.startSlot = config.startSlot || 0;
   }
 
-  async loadPriceHistory(prices: PriceData[]): Promise<void> {
-    this.priceHistory = [...prices];
-    this.currentSlot = 0;
-    console.log(`Loaded ${this.priceHistory.length} historical prices for lag replay`);
+  async init(): Promise<void> {
+    this.historicalPrices = await getHistoricalJitoPrices();
+    if (this.historicalPrices.length === 0) {
+      throw new Error("No historical Jito prices available");
+    }
+    // Ensure all prices have timestamps
+    this.historicalPrices = this.historicalPrices.map((p, i) => ({
+      ...p,
+      timestamp: p.timestamp || Math.floor(Date.now() / 1000) - (this.historicalPrices.length - i) * 5,
+      slot: p.slot || this.startSlot + i * 2,
+    }));
+    this.currentIndex = 0;
   }
 
-  async advanceSlot(slots: number = 1): Promise<void> {
-    this.currentSlot += slots;
-    await this.injectLag();
+  async injectPriceAtSlot(targetSlot: number): Promise<void> {
+    if (this.historicalPrices.length === 0) {
+      await this.init();
+    }
+
+    const lagSlots = Math.floor(this.lagSeconds * 2); // ~2 slots per second on test validator
+    const effectiveSlot = Math.max(targetSlot - lagSlots, this.startSlot);
+    
+    // Find the price that would have been observed lagSlots ago
+    let index = this.currentIndex;
+    while (index < this.historicalPrices.length - 1 && this.historicalPrices[index].slot < effectiveSlot) {
+      index++;
+    }
+    this.currentIndex = Math.min(index, this.historicalPrices.length - 1);
+
+    const priceData = this.historicalPrices[this.currentIndex];
+
+    await this.oracleUtils.updatePriceFeed(
+      this.priceFeed,
+      priceData.price,
+      priceData.confidence,
+      priceData.slot,
+      priceData.timestamp
+    );
   }
 
-  async injectLag(): Promise<void> {
-    if (this.priceHistory.length === 0) return;
-
-    // Calculate lagged index: lagSlots behind current simulated slot
-    const lagIndex = Math.max(0, this.currentSlot - this.config.lagSlots);
-    const effectiveIndex = Math.min(lagIndex, this.priceHistory.length - 1);
-    const laggedPrice = this.priceHistory[effectiveIndex];
-
-    console.log(`[LagInjector] Slot ${this.currentSlot} | lag=${this.config.lagSlots} | using price from slot ~${effectiveIndex} = ${laggedPrice.price}`);
-
-    // Update on-chain oracle with the lagged price
-    await this.oracleUtils.setPrice(this.config.priceFeed, laggedPrice.price, laggedPrice.confidence, this.currentSlot);
+  getCurrentLagPrice(): PriceData | null {
+    if (this.historicalPrices.length === 0 || this.currentIndex >= this.historicalPrices.length) {
+      return null;
+    }
+    return this.historicalPrices[this.currentIndex];
   }
 
-  getCurrentLagPrice(): number {
-    if (this.priceHistory.length === 0) return 1.0;
-    const lagIndex = Math.max(0, this.currentSlot - this.config.lagSlots);
-    const effectiveIndex = Math.min(lagIndex, this.priceHistory.length - 1);
-    return this.priceHistory[effectiveIndex].price;
+  reset(): void {
+    this.currentIndex = 0;
   }
+}
 
-  async replayLastThreeDepegs(): Promise<void> {
-    // Simulated JitoSOL depeg series (price, confidence). Real data would be loaded from JSON.
-    const depegSeries: PriceData[] = [
-      // Stable period
-      { price: 1.00, confidence: 0.001, slot: 100 },
-      { price: 1.00, confidence: 0.001, slot: 110 },
-      { price: 0.999, confidence: 0.002, slot: 120 },
-      // First depeg (flash crash to ~0.92)
-      { price: 0.98, confidence: 0.01, slot: 200 },
-      { price: 0.94, confidence: 0.03, slot: 210 },
-      { price: 0.92, confidence: 0.05, slot: 220 },
-      { price: 0.93, confidence: 0.04, slot: 230 },
-      // Recovery
-      { price: 0.96, confidence: 0.02, slot: 240 },
-      { price: 0.99, confidence: 0.005, slot: 250 },
-      // Second depeg
-      { price: 0.97, confidence: 0.015, slot: 300 },
-      { price: 0.89, confidence: 0.08, slot: 310 },
-      { price: 0.85, confidence: 0.12, slot: 320 },
-      { price: 0.88, confidence: 0.09, slot: 330 },
-      // Third (milder) depeg used for false-positive testing
-      { price: 0.975, confidence: 0.008, slot: 400 },
-      { price: 0.96, confidence: 0.012, slot: 410 },
-      { price: 0.955, confidence: 0.018, slot: 420 },
-      { price: 0.97, confidence: 0.006, slot: 430 },
-    ];
-
-    await this.loadPriceHistory(depegSeries);
-    console.log("Replaying last three JitoSOL depeg events with configurable oracle lag");
-  }
+// Default config for JitoSOL depeg sim (45s target lag)
+export function createDefaultLagInjector(connection: Connection): LagInjector {
+  return new LagInjector({
+    lagSeconds: 45,
+    oracleProgramId: new PublicKey("oracle1111111111111111111111111111111111111111"), // placeholder for sim
+    priceFeed: new PublicKey("jitoSOLPriceFeed1111111111111111111111111111111"),
+  }, connection);
 }
