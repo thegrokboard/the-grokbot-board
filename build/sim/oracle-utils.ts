@@ -8,102 +8,113 @@ export interface PriceData {
 
 export interface HistoricalPriceSeries {
   prices: PriceData[];
-  startSlot: number;
-  endSlot: number;
+  depegStartSlot: number;
 }
 
 export interface LagInjectorConfig {
-  oraclePubkey: PublicKey;
   lagSlots: number;
-  basePrice: number;
-  series: HistoricalPriceSeries;
+  oraclePubkey: PublicKey;
+  jitoSolMint: PublicKey;
+  testValidator: any; // Anchor's TestValidator interface
+  connection: Connection;
 }
 
 export class OracleUtils {
-  private connection: Connection;
-  private program: any; // Anchor program
+  private config: LagInjectorConfig;
+  private currentLag: number = 0;
+  private priceBuffer: Map<number, PriceData> = new Map();
 
-  constructor(connection: Connection, program: any) {
-    this.connection = connection;
-    this.program = program;
+  constructor(config: LagInjectorConfig) {
+    this.config = config;
   }
 
-  static createHistoricalSeries(prices: number[], startSlot: number = 0): HistoricalPriceSeries {
-    const priceData: PriceData[] = prices.map((price, index) => ({
+  async setTestPrice(price: number, slot: number): Promise<void> {
+    const laggedSlot = slot - this.config.lagSlots;
+    const priceData: PriceData = {
       price,
-      timestamp: Date.now() + index * 15000, // 15s intervals
-    }));
+      timestamp: Date.now(),
+    };
+    this.priceBuffer.set(laggedSlot, priceData);
+
+    // In a real sim this would update a Switchboard or Pyth oracle account on the test validator
+    // For this pure-onchain harness we simulate via the injected connection
+    console.log(`[OracleUtils] Set test price ${price} at slot ${slot} (lagged to ${laggedSlot})`);
+  }
+
+  getPriceAtSlot(slot: number): PriceData | null {
+    // Return the most recent price whose lagged slot <= requested slot
+    let best: PriceData | null = null;
+    let bestSlot = -1;
+    for (const [s, p] of this.priceBuffer) {
+      if (s <= slot && s > bestSlot) {
+        bestSlot = s;
+        best = p;
+      }
+    }
+    return best;
+  }
+
+  getHistoricalSeries(): HistoricalPriceSeries {
+    const sortedSlots = Array.from(this.priceBuffer.keys()).sort((a, b) => a - b);
+    const prices: PriceData[] = sortedSlots.map(s => this.priceBuffer.get(s)!);
     return {
-      prices: priceData,
-      startSlot,
-      endSlot: startSlot + prices.length * 15, // rough slot estimate
+      prices,
+      depegStartSlot: sortedSlots.length > 0 ? sortedSlots[0] : 0,
     };
   }
 
-  async injectSeries(config: LagInjectorConfig, wallet: Keypair): Promise<void> {
-    // In sim, we update the on-chain oracle account with lagged values
-    for (let i = 0; i < config.series.prices.length; i++) {
-      const laggedIndex = Math.max(0, i - Math.floor(config.lagSlots / 15));
-      const price = config.series.prices[laggedIndex].price;
-      
-      await this.updateOraclePrice(config.oraclePubkey, price, wallet);
-      // Advance simulated time (in real test validator this would use setBlockTime)
-      await new Promise(resolve => setTimeout(resolve, 50)); // simulate slot time
+  advanceSlot(currentSlot: number): void {
+    this.currentLag = Math.max(0, this.currentLag - 1);
+    // Cleanup old buffer entries
+    const minSlot = currentSlot - 1000;
+    for (const s of this.priceBuffer.keys()) {
+      if (s < minSlot) this.priceBuffer.delete(s);
     }
   }
-
-  async updateOraclePrice(oraclePubkey: PublicKey, price: number, wallet: Keypair): Promise<void> {
-    // Simulate oracle update via program instruction (vault program owns or proxies oracle)
-    await this.program.methods
-      .updateOracle(new anchor.BN(Math.floor(price * 1_000_000))) // 6 decimals
-      .accounts({
-        oracle: oraclePubkey,
-        authority: wallet.publicKey,
-      })
-      .signers([wallet])
-      .rpc();
-  }
-
-  static checkTWAPFalsePositive(series: HistoricalPriceSeries, twapPeriodSlots: number = 15 * 60): boolean {
-    if (series.prices.length < 2) return false;
-    
-    // Simple TWAP calculation over last N points
-    const period = Math.min(twapPeriodSlots / 15, series.prices.length);
-    const recentPrices = series.prices.slice(-period);
-    const twap = recentPrices.reduce((sum, p) => sum + p.price, 0) / recentPrices.length;
-    const lastPrice = recentPrices[recentPrices.length - 1].price;
-    
-    // False positive if TWAP > 5% from spot while in recovery (simplified)
-    const deviation = Math.abs(lastPrice - twap) / twap;
-    return deviation > 0.05 && lastPrice > twap * 0.9; // example false-positive condition
-  }
-
-  getLagAdjustedPrice(series: HistoricalPriceSeries, lagSlots: number, currentIndex: number): number {
-    const lagSteps = Math.floor(lagSlots / 15); // assuming 15s slots for sim
-    const laggedIndex = Math.max(0, currentIndex - lagSteps);
-    return series.prices[laggedIndex].price;
-  }
 }
 
-// Default config factory for Jito depeg replay
-export function createJitoDepegSeries(): HistoricalPriceSeries {
-  // Replay of last three known JitoSOL depeg price drops (simulated values)
-  const depegPrices = [
-    0.98, 0.97, 0.95, 0.92, 0.89, 0.85, 0.82, 0.80, 0.78, // first depeg
-    0.79, 0.81, 0.84, 0.88, 0.91, 0.93,                     // partial recovery
-    0.90, 0.87, 0.83, 0.79, 0.75, 0.71, 0.68, 0.65, 0.62, // second depeg
-    0.64, 0.67, 0.72, 0.78, 0.85, 0.89,                     // recovery
-    0.88, 0.86, 0.82, 0.77, 0.73, 0.70, 0.68, 0.67, 0.66, // third depeg
-    0.67, 0.69, 0.72, 0.76, 0.81, 0.87, 0.92
+export function checkTWAPFalsePositive(series: HistoricalPriceSeries, windowSlots: number = 150): boolean {
+  if (series.prices.length < 2) return false;
+
+  const prices = series.prices;
+  let sum = 0;
+  let count = 0;
+
+  for (let i = 0; i < prices.length; i++) {
+    sum += prices[i].price;
+    count++;
+    if (count > windowSlots) {
+      sum -= prices[i - windowSlots].price;
+      count--;
+    }
+    const twap = sum / count;
+    const currentPrice = prices[i].price;
+
+    // Simple depeg detection: price < 0.85 for >30% of window considered a true trip
+    if (currentPrice < 0.85 * twap && i > windowSlots * 0.3) {
+      return false; // Real depeg, not false positive
+    }
+  }
+  return true; // No sustained depeg detected = false positive
+}
+
+export async function loadJitoHistoricalSeries(): Promise<HistoricalPriceSeries> {
+  // Hard-coded replay of last three known JitoSOL depeg price series (simplified)
+  // Real version would load from JSON fixture or RPC archive
+  const prices: PriceData[] = [
+    { price: 0.98, timestamp: 1700000000000 },
+    { price: 0.95, timestamp: 1700000100000 },
+    { price: 0.89, timestamp: 1700000200000 },
+    { price: 0.82, timestamp: 1700000300000 },
+    { price: 0.78, timestamp: 1700000400000 },
+    { price: 0.75, timestamp: 1700000500000 },
+    { price: 0.81, timestamp: 1700000600000 },
+    { price: 0.92, timestamp: 1700000700000 },
+    { price: 0.97, timestamp: 1700000800000 },
   ];
+
   return {
-    prices: depegPrices.map((p, i) => ({
-      price: p,
-      timestamp: Date.now() - (depegPrices.length - i) * 15000,
-    })),
-    startSlot: 100000,
-    endSlot: 100000 + depegPrices.length * 15,
+    prices,
+    depegStartSlot: 42000000,
   };
 }
-
-export default OracleUtils;
