@@ -1,5 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection } from "@solana/web3.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 
 export interface PriceData {
   price: number;
@@ -12,75 +12,100 @@ export interface HistoricalPriceSeries {
 }
 
 export interface LagInjectorConfig {
-  lagSlots: number;
-  oracleProgramId: PublicKey;
-  priceFeed: PublicKey;
-  slotDurationMs?: number; // optional to satisfy older references
+  oracleLagSlots: number;
+  slotDurationMs: number;
+  basePriceSeries: PriceData[];
 }
 
 export interface OracleLagInjector {
-  injectLag(connection: Connection, config: LagInjectorConfig): Promise<void>;
-  injectPrice(price: number, slot: number): Promise<void>;
-  getCurrentPrice(): Promise<PriceData>;
-  getRecentPrices(count: number): Promise<PriceData[]>;
+  injectPriceAtSlot(slot: number, price: number): Promise<void>;
+  getCurrentPrice(): Promise<number>;
+  getPriceHistory(): Promise<PriceData[]>;
+  advanceSlot(): Promise<void>;
   getHistoricalPriceSeries(startSlot: number, endSlot: number): Promise<HistoricalPriceSeries>;
+  injectPrice(price: number): Promise<void>;
+  getRecentPrices(count: number): Promise<PriceData[]>;
 }
 
 export class OracleLagInjectorImpl implements OracleLagInjector {
-  private prices: PriceData[] = [];
-  private currentSlot = 1000;
-  private lagSlots: number = 45 * 2; // approx 45s at 400ms/slot
+  private currentSlot: number = 0;
+  private prices: Map<number, PriceData> = new Map();
+  private config: LagInjectorConfig;
 
-  constructor(private connection: Connection, config?: LagInjectorConfig) {
-    if (config) {
-      this.lagSlots = config.lagSlots;
+  constructor(config: LagInjectorConfig) {
+    this.config = { ...config };
+    this.currentSlot = 0;
+    // Seed initial prices
+    for (const p of this.config.basePriceSeries) {
+      this.prices.set(p.slot, { ...p });
+    }
+    if (this.prices.size === 0 && this.config.basePriceSeries.length > 0) {
+      this.currentSlot = this.config.basePriceSeries[0].slot;
     }
   }
 
-  async injectLag(connection: Connection, config: LagInjectorConfig): Promise<void> {
-    this.lagSlots = config.lagSlots;
-    // Simulate lag by advancing internal clock without updating oracle on-chain
-    console.log(`[LagInjector] Configured lag of ${this.lagSlots} slots`);
-    this.currentSlot += this.lagSlots;
+  async injectPriceAtSlot(slot: number, price: number): Promise<void> {
+    this.prices.set(slot, {
+      price,
+      slot,
+      timestamp: Date.now(),
+    });
   }
 
-  async injectPrice(price: number, slot: number): Promise<void> {
-    this.prices.push({ price, slot, timestamp: Date.now() });
-    this.currentSlot = Math.max(this.currentSlot, slot);
-    console.log(`[LagInjector] Injected price ${price} at slot ${slot}`);
+  async getCurrentPrice(): Promise<number> {
+    const recent = await this.getRecentPrices(1);
+    return recent.length > 0 ? recent[0].price : 1.0;
   }
 
-  async getCurrentPrice(): Promise<PriceData> {
-    if (this.prices.length === 0) {
-      return { price: 1.0, slot: this.currentSlot, timestamp: Date.now() };
+  async getPriceHistory(): Promise<PriceData[]> {
+    return Array.from(this.prices.values())
+      .sort((a, b) => a.slot - b.slot);
+  }
+
+  async advanceSlot(): Promise<void> {
+    this.currentSlot += 1;
+    // Auto-inject lagged price if we have history
+    const laggedSlot = this.currentSlot - this.config.oracleLagSlots;
+    const laggedPrice = this.prices.get(laggedSlot);
+    if (laggedPrice) {
+      await this.injectPriceAtSlot(this.currentSlot, laggedPrice.price);
     }
-    return this.prices[this.prices.length - 1];
-  }
-
-  async getRecentPrices(count: number): Promise<PriceData[]> {
-    return this.prices.slice(-count);
   }
 
   async getHistoricalPriceSeries(startSlot: number, endSlot: number): Promise<HistoricalPriceSeries> {
-    const filtered = this.prices.filter(p => p.slot >= startSlot && p.slot <= endSlot);
+    const filtered = Array.from(this.prices.values())
+      .filter(p => p.slot >= startSlot && p.slot <= endSlot)
+      .sort((a, b) => a.slot - b.slot);
     return { prices: filtered };
+  }
+
+  async injectPrice(price: number): Promise<void> {
+    await this.injectPriceAtSlot(this.currentSlot, price);
+  }
+
+  async getRecentPrices(count: number): Promise<PriceData[]> {
+    const sorted = await this.getPriceHistory();
+    return sorted.slice(-count);
   }
 }
 
-export function injectLag(connection: Connection, config: LagInjectorConfig): Promise<void> {
-  const injector = new OracleLagInjectorImpl(connection, config);
-  return injector.injectLag(connection, config);
-}
-
-export function getHistoricalPriceSeries(
-  series: HistoricalPriceSeries,
-  lagSlots: number
-): HistoricalPriceSeries {
-  const laggedPrices = series.prices.map(p => ({
+export function injectLag(series: PriceData[], lagSlots: number): PriceData[] {
+  return series.map(p => ({
     ...p,
-    slot: p.slot - lagSlots,
+    slot: p.slot + lagSlots,
   }));
-  return { prices: laggedPrices };
 }
 
-export const OracleLagInjector = OracleLagInjectorImpl;
+export async function getHistoricalPriceSeries(
+  connection: Connection,
+  oraclePubkey: PublicKey,
+  startSlot: number,
+  endSlot: number
+): Promise<HistoricalPriceSeries> {
+  // Stub for test validator simulation - in real use would query onchain oracle
+  return { prices: [] };
+}
+
+export function createLagInjector(config: LagInjectorConfig): OracleLagInjector {
+  return new OracleLagInjectorImpl(config);
+}
