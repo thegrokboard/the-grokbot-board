@@ -3,131 +3,131 @@ import { Connection, PublicKey, Keypair } from "@solana/web3.js";
 import { LagInjector } from "./lag-injector";
 import { checkTWAPFalsePositive } from "./twap-checker";
 import { getHistoricalJitoPrices, PriceData } from "./oracle-utils";
+import fs from "fs";
 
-interface TWAPConfig {
-  windowSlots: number;
-  thresholdBps: number;
+const RPC_URL = "http://127.0.0.1:8899";
+const JITO_SOL_MINT = new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn");
+const ORACLE_PROGRAM = new PublicKey("7XqX3Z8vU6v4z7v9vU6v4z7v9vU6v4z7v9vU6v4z7v9");
+const VAULT_PROGRAM_ID = new PublicKey("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+
+interface SimulationConfig {
+  lagSeconds: number;
+  twapWindowSeconds: number;
+  drawdownThresholdBps: number;
+  replayDays: number;
+  tickIntervalMs: number;
 }
 
-interface SimulationResult {
-  breakerTrips: number;
-  falsePositives: number;
-  totalTicks: number;
-  logs: string[];
-}
+const DEFAULT_CONFIG: SimulationConfig = {
+  lagSeconds: 45,
+  twapWindowSeconds: 15,
+  drawdownThresholdBps: 500, // 5%
+  replayDays: 7,
+  tickIntervalMs: 15000,
+};
 
-export class TickRunner {
+class TickRunner {
   private connection: Connection;
-  private lagInjector: LagInjector;
-  private twapConfig: TWAPConfig;
-  private vaultProgramId: PublicKey;
-  private logs: string[] = [];
-  private breakerTrips = 0;
-  private falsePositives = 0;
+  private injector: LagInjector;
+  private config: SimulationConfig;
+  private breakerTrips: number = 0;
+  private falsePositives: number = 0;
+  private totalTicks: number = 0;
 
-  constructor(
-    connection: Connection,
-    lagInjector: LagInjector,
-    twapConfig: TWAPConfig,
-    vaultProgramId: PublicKey
-  ) {
-    this.connection = connection;
-    this.lagInjector = lagInjector;
-    this.twapConfig = twapConfig;
-    this.vaultProgramId = vaultProgramId;
+  constructor(config: Partial<SimulationConfig> = {}) {
+    this.connection = new Connection(RPC_URL, "confirmed");
+    this.config = { ...DEFAULT_CONFIG, ...config };
+    this.injector = new LagInjector(this.connection, this.config.lagSeconds);
   }
 
-  private log(message: string): void {
-    const ts = new Date().toISOString();
-    this.logs.push(`[${ts}] ${message}`);
-    console.log(`[${ts}] ${message}`);
-  }
+  async run(): Promise<void> {
+    console.log("Starting 7-day JitoSOL depeg simulation with lag injector...");
+    console.log(`Config: lag=${this.config.lagSeconds}s, TWAP=${this.config.twapWindowSeconds}s, threshold=${this.config.drawdownThresholdBps}bps`);
 
-  async run7DaySimulation(): Promise<SimulationResult> {
-    this.log("Starting 7-day JitoSOL depeg simulation with onchain vault harness");
-    
-    const historicalPrices: PriceData[] = getHistoricalJitoPrices();
-    this.log(`Loaded ${historicalPrices.length} historical price points`);
+    const series: PriceData[] = await getHistoricalJitoPrices(this.config.replayDays);
+    if (series.length === 0) {
+      throw new Error("No historical price data available");
+    }
 
-    // Replay the series with configured oracle lag (target ~45s)
-    await this.lagInjector.replay(historicalPrices);
-    this.log(`Replayed series with lag injector (target lag: 45 slots)`);
+    console.log(`Loaded ${series.length} price points for replay.`);
 
-    const tickIntervalSlots = 15; // 15s TWAP check interval
-    const totalTicks = Math.floor(historicalPrices.length / tickIntervalSlots);
-    this.log(`Running ${totalTicks} ticks over replayed data`);
+    // Replay the series with configurable oracle lag
+    const laggedPrices = await this.injector.replayWithLag(series, this.config.lagSeconds);
 
-    for (let tick = 0; tick < totalTicks; tick++) {
-      const currentSlot = tick * tickIntervalSlots;
-      const currentPrice = this.lagInjector.getPriceAt(currentSlot);
-      
-      if (!currentPrice) {
-        this.log(`Tick ${tick}: no price available at slot ${currentSlot}`);
-        continue;
-      }
+    let lastPrice: PriceData | null = null;
+    const startTime = Date.now();
 
-      const isFalsePositive = checkTWAPFalsePositive(
-        historicalPrices,
-        currentSlot,
-        this.twapConfig
+    for (let i = 0; i < laggedPrices.length; i++) {
+      const currentPrice = laggedPrices[i];
+      this.totalTicks++;
+
+      // Check for circuit breaker trip using 15s TWAP
+      const isTrip = checkTWAPFalsePositive(
+        laggedPrices,
+        i,
+        this.config.twapWindowSeconds,
+        this.config.drawdownThresholdBps
       );
 
-      const shouldTrip = !isFalsePositive && currentPrice.price < 0.95; // example drawdown threshold
-
-      if (shouldTrip) {
+      if (isTrip) {
         this.breakerTrips++;
-        this.log(`Tick ${tick} (slot ${currentSlot}): CIRCUIT BREAKER TRIPPED at price $${currentPrice.price}`);
-      } else if (isFalsePositive) {
+        console.log(`[${new Date(currentPrice.timestamp * 1000).toISOString()}] CIRCUIT BREAKER TRIPPED at price $${currentPrice.price.toFixed(4)}`);
+      } else if (lastPrice && this.isSignificantDrawdown(lastPrice, currentPrice)) {
         this.falsePositives++;
-        this.log(`Tick ${tick} (slot ${currentSlot}): false positive detected (price $${currentPrice.price})`);
-      } else if (currentPrice.price < 0.97) {
-        this.log(`Tick ${tick} (slot ${currentSlot}): drawdown observed $${currentPrice.price} (no trip)`);
+        console.log(`[${new Date(currentPrice.timestamp * 1000).toISOString()}] False positive avoided at $${currentPrice.price.toFixed(4)}`);
+      }
+
+      lastPrice = currentPrice;
+
+      // Simulate real-time ticking
+      if (i % 10 === 0) {
+        console.log(`Progress: ${Math.round((i / laggedPrices.length) * 100)}% | Trips: ${this.breakerTrips} | FP: ${this.falsePositives}`);
+      }
+
+      // Throttle to simulate 15s ticks
+      if (i < laggedPrices.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, this.config.tickIntervalMs / 10));
       }
     }
 
-    this.log(`Simulation complete. Breaker trips: ${this.breakerTrips}, False positives: ${this.falsePositives}`);
-    
-    return {
-      breakerTrips: this.breakerTrips,
-      falsePositives: this.falsePositives,
-      totalTicks,
-      logs: this.logs
-    };
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    this.logResults(duration);
   }
 
-  getLogs(): string[] {
-    return this.logs;
+  private isSignificantDrawdown(prev: PriceData, curr: PriceData): boolean {
+    if (prev.price === 0) return false;
+    const dropBps = ((prev.price - curr.price) / prev.price) * 10000;
+    return dropBps > this.config.drawdownThresholdBps / 2;
+  }
+
+  private logResults(duration: string): void {
+    console.log("\n=== Simulation Complete ===");
+    console.log(`Duration: ${duration}s`);
+    console.log(`Total ticks: ${this.totalTicks}`);
+    console.log(`Circuit breaker trips: ${this.breakerTrips}`);
+    console.log(`False positives avoided: ${this.falsePositives}`);
+    console.log(`False positive rate: ${this.totalTicks > 0 ? ((this.falsePositives / this.totalTicks) * 100).toFixed(2) : 0}%`);
+
+    const results = {
+      config: this.config,
+      trips: this.breakerTrips,
+      falsePositives: this.falsePositives,
+      totalTicks: this.totalTicks,
+      timestamp: new Date().toISOString(),
+    };
+
+    fs.writeFileSync("sim-results.json", JSON.stringify(results, null, 2));
+    console.log("Results written to sim-results.json");
   }
 }
 
-// CLI entrypoint for the 7-day tick runner
-async function main() {
-  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
-  
-  // Minimal vault program ID for test validator sim
-  const vaultProgramId = new PublicKey("VAULt9T2L7vJ4J9p9v9v9v9v9v9v9v9v9v9v9v9v");
-
-  const lagInjector = new LagInjector(connection, 45); // target 45-slot lag
-  
-  const twapConfig: TWAPConfig = {
-    windowSlots: 150,   // ~1 minute TWAP window
-    thresholdBps: 500   // 5% drawdown threshold
-  };
-
-  const runner = new TickRunner(connection, lagInjector, twapConfig, vaultProgramId);
-  
-  try {
-    const result = await runner.run7DaySimulation();
-    console.log("\n=== SIMULATION SUMMARY ===");
-    console.log(`Breaker trips: ${result.breakerTrips}`);
-    console.log(`False positives: ${result.falsePositives}`);
-    console.log(`Total ticks: ${result.totalTicks}`);
-  } catch (err) {
+// Run the simulation if this file is executed directly
+if (require.main === module) {
+  const runner = new TickRunner();
+  runner.run().catch((err) => {
     console.error("Simulation failed:", err);
     process.exit(1);
-  }
+  });
 }
 
-if (require.main === module) {
-  main().catch(console.error);
-}
+export { TickRunner, SimulationConfig };
