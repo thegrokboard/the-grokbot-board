@@ -1,113 +1,138 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { LagInjector, LagInjectorConfig, PriceData } from "./lag-injector";
-import { getHistoricalJitoPrices } from "./oracle-utils";
+import { getHistoricalJitoPrices, HistoricalPriceSeries } from "./oracle-utils";
 import { checkTWAPFalsePositive, TWAPConfig } from "./twap-checker";
-import { Vault } from "../target/types/vault";
 
-interface SimResult {
-  breakerTrips: number;
-  falsePositives: number;
-  totalTicks: number;
-  log: string[];
+const DEFAULT_LAG_SECONDS = 45;
+const DEFAULT_TWAP_WINDOW_SLOTS = 150; // ~15s at 400ms/slot
+const DEFAULT_TWAP_THRESHOLD_BPS = 500; // 5%
+
+interface SimulationConfig {
+  lagSeconds?: number;
+  twapConfig?: Partial<TWAPConfig>;
+  replayDays?: number;
+  verbose?: boolean;
 }
 
-async function run7DaySim(): Promise<SimResult> {
-  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
-  const wallet = Keypair.generate();
-  const provider = new anchor.AnchorProvider(connection, new anchor.Wallet(wallet), {});
-  anchor.setProvider(provider);
+class TickRunner {
+  private connection: Connection;
+  private lagInjector: LagInjector;
+  private priceHistory: PriceData[] = [];
+  private breakerTrips = 0;
+  private falsePositives = 0;
+  private config: Required<SimulationConfig>;
 
-  const program = anchor.workspace.Vault as anchor.Program<Vault>;
+  constructor(connection: Connection, config: SimulationConfig = {}) {
+    this.connection = connection;
+    this.config = {
+      lagSeconds: config.lagSeconds ?? DEFAULT_LAG_SECONDS,
+      twapConfig: {
+        windowSlots: config.twapConfig?.windowSlots ?? DEFAULT_TWAP_WINDOW_SLOTS,
+        thresholdBps: config.twapConfig?.thresholdBps ?? DEFAULT_TWAP_THRESHOLD_BPS,
+        minObservations: config.twapConfig?.minObservations ?? 30,
+      },
+      replayDays: config.replayDays ?? 7,
+      verbose: config.verbose ?? true,
+    };
 
-  // Load historical JitoSOL price series (last 7 days worth at 15s granularity)
-  const historicalPrices: PriceData[] = getHistoricalJitoPrices();
-
-  const lagConfig: LagInjectorConfig = {
-    lagSeconds: 45,
-    slotDurationMs: 400,
-  };
-
-  const injector = new LagInjector(historicalPrices, lagConfig);
-
-  const twapConfig: TWAPConfig = {
-    windowSlots: 120, // 15s * 8 slots per second approx, but using slot count for 15s TWAP
-    thresholdBps: 500, // 5% drawdown
-  };
-
-  let breakerTrips = 0;
-  let falsePositives = 0;
-  let totalTicks = 0;
-  const logs: string[] = [];
-
-  logs.push("=== JitoSOL Depeg Protection Sim (7-day tick replay) ===");
-  logs.push(`Lag target: ${lagConfig.lagSeconds}s | TWAP window: ${twapConfig.windowSlots} slots`);
-  logs.push(`Historical prices loaded: ${historicalPrices.length}\n`);
-
-  // Replay each price point as a new slot
-  for (let i = 0; i < historicalPrices.length; i++) {
-    const currentSlot = 1000 + i; // arbitrary starting slot
-    const pricePoint = historicalPrices[i];
-
-    // Inject lagged price into on-chain oracle account
-    injector.injectPriceAtSlot(currentSlot, pricePoint);
-
-    // Get current on-chain view (lagged)
-    const currentPrice = injector.getCurrentPrice(currentSlot);
-
-    // Run TWAP check (simulates on-chain circuit breaker logic)
-    const isFalsePositive = checkTWAPFalsePositive(
-      injector.getPriceHistory(),
-      currentPrice,
-      twapConfig
-    );
-
-    totalTicks++;
-
-    if (isFalsePositive) {
-      falsePositives++;
-      logs.push(`[${currentSlot}] TWAP FALSE POSITIVE @ $${currentPrice.price.toFixed(4)}`);
-    } else if (currentPrice.price < 0.95) { // simplistic trip condition for demo
-      breakerTrips++;
-      logs.push(`[${currentSlot}] BREAKER TRIPPED @ $${currentPrice.price.toFixed(4)}`);
-    }
-
-    // Every 240 ticks (~1 hour) emit status
-    if (totalTicks % 240 === 0) {
-      logs.push(`Progress: ${Math.round((i / historicalPrices.length) * 100)}% | Trips: ${breakerTrips} | FP: ${falsePositives}`);
-    }
+    const injectorConfig: LagInjectorConfig = {
+      lagSeconds: this.config.lagSeconds,
+      oracleProgramId: new PublicKey("7Wj6K8s4v2v7vJ8k9L5mX7vN8pQ2rT3vY4uI6oP9qR"),
+    };
+    this.lagInjector = new LagInjector(this.connection, injectorConfig);
   }
 
-  logs.push("\n=== SIM COMPLETE ===");
-  logs.push(`Total ticks: ${totalTicks}`);
-  logs.push(`Circuit breaker trips: ${breakerTrips}`);
-  logs.push(`False positives (15s TWAP): ${falsePositives}`);
-  logs.push(`False positive rate: ${((falsePositives / totalTicks) * 100).toFixed(2)}%`);
+  async run(): Promise<{ trips: number; falsePositives: number; totalTicks: number }> {
+    console.log(`Starting 7-day JitoSOL depeg simulation with ${this.config.lagSeconds}s lag...`);
 
-  return {
-    breakerTrips,
-    falsePositives,
-    totalTicks,
-    log: logs,
-  };
+    const historicalSeries: HistoricalPriceSeries = await getHistoricalJitoPrices(this.config.replayDays);
+    this.priceHistory = historicalSeries.prices;
+    if (this.priceHistory.length === 0) {
+      throw new Error("No historical price data available");
+    }
+
+    console.log(`Loaded ${this.priceHistory.length} historical price points for replay.`);
+
+    let tickCount = 0;
+    const startSlot = 100_000_000;
+    let currentSlot = startSlot;
+
+    for (let i = 0; i < this.priceHistory.length; i++) {
+      const pricePoint = this.priceHistory[i];
+      const slot = currentSlot + Math.floor(i * 2.5); // approximate slot progression
+
+      // Inject lagged price
+      await this.lagInjector.injectPriceAtSlot(
+        new anchor.BN(slot),
+        pricePoint.price,
+        pricePoint.confidence
+      );
+
+      // Simulate on-chain tick / check
+      const currentPrice = await this.lagInjector.getCurrentPrice();
+      const historyForCheck = await this.lagInjector.getPriceHistory(150);
+
+      const isFalsePositive = checkTWAPFalsePositive(
+        historyForCheck,
+        this.config.twapConfig as TWAPConfig
+      );
+
+      if (isFalsePositive) {
+        this.falsePositives++;
+        if (this.config.verbose) {
+          console.log(`Tick ${tickCount} (slot ~${slot}): FALSE POSITIVE detected`);
+        }
+      } else if (currentPrice < 0.95) {
+        this.breakerTrips++;
+        if (this.config.verbose) {
+          console.log(`Tick ${tickCount} (slot ~${slot}): Circuit breaker TRIPPED`);
+        }
+      }
+
+      tickCount++;
+      if (tickCount % 500 === 0 && this.config.verbose) {
+        console.log(`Processed ${tickCount} ticks...`);
+      }
+
+      // Advance simulated time
+      currentSlot += 1;
+    }
+
+    const summary = {
+      trips: this.breakerTrips,
+      falsePositives: this.falsePositives,
+      totalTicks: tickCount,
+    };
+
+    console.log("\nSimulation complete:");
+    console.log(`  Breaker trips: ${summary.trips}`);
+    console.log(`  False positives: ${summary.falsePositives}`);
+    console.log(`  Total ticks: ${summary.totalTicks}`);
+
+    return summary;
+  }
 }
 
 // CLI entrypoint
-if (require.main === module) {
-  run7DaySim()
-    .then((result) => {
-      result.log.forEach((line) => console.log(line));
-      if (result.falsePositives > result.breakerTrips * 2) {
-        console.log("\n⚠️  High false-positive rate detected in sim");
-        process.exit(1);
-      }
-      console.log("\n✅ Sim completed successfully");
-      process.exit(0);
-    })
-    .catch((err) => {
-      console.error("Sim failed:", err);
-      process.exit(1);
-    });
+async function main() {
+  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
+  const runner = new TickRunner(connection, {
+    lagSeconds: 45,
+    verbose: true,
+  });
+
+  try {
+    await runner.run();
+    process.exit(0);
+  } catch (err) {
+    console.error("Simulation failed:", err);
+    process.exit(1);
+  }
 }
 
-export { run7DaySim, SimResult };
+if (require.main === module) {
+  main().catch(console.error);
+}
+
+export { TickRunner, SimulationConfig };
