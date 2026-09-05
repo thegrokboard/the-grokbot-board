@@ -1,85 +1,137 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection, Keypair } from "@solana/web3.js";
-import { PriceData, HistoricalPriceSeries, LagInjectorConfig, OracleLagInjector } from "./oracle-utils";
+import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+
+export interface PriceData {
+  price: number;
+  confidence: number;
+  timestamp: number;
+  slot: number;
+}
+
+export interface HistoricalPriceSeries {
+  prices: PriceData[];
+  depegStartSlot: number;
+}
+
+export interface LagInjectorConfig {
+  rpcUrl: string;
+  lagSeconds: number;
+  startSlot?: number;
+}
+
+export interface OracleLagInjector {
+  injectPriceAtSlot(slot: number, price: number, confidence?: number): Promise<void>;
+  getCurrentPrice(): Promise<PriceData>;
+  getPriceHistory(): HistoricalPriceSeries;
+  advanceSlot(slots?: number): Promise<number>;
+}
 
 export class LagInjector implements OracleLagInjector {
   private connection: Connection;
+  private currentSlot: number;
+  private priceHistory: PriceData[] = [];
+  private lagSlots: number;
   private config: LagInjectorConfig;
-  private historicalPrices: HistoricalPriceSeries = [];
-  private currentSlot: number = 0;
-  private lagSlots: number = 0;
 
   constructor(config: LagInjectorConfig) {
     this.config = config;
-    this.connection = new Connection(config.rpcUrl || "http://127.0.0.1:8899", "confirmed");
+    this.connection = new Connection(config.rpcUrl, "confirmed");
     this.lagSlots = Math.floor((config.lagSeconds || 45) * 2); // ~2 slots per second
-    this.historicalPrices = this.loadJitoDepegSeries();
+    this.currentSlot = config.startSlot || 100_000_000;
+    this.priceHistory = [];
+    this.initializeHistoricalData();
   }
 
-  private loadJitoDepegSeries(): HistoricalPriceSeries {
-    // Replay of last three known JitoSOL depeg price series (simulated real data)
-    // Prices in SOL (e.g. 0.92 = $0.92), confidence normalized 0-1, slot increments ~0.5s
-    return [
-      // Series 1: gradual depeg
-      { price: 0.98, confidence: 0.95, timestamp: 1000 },
-      { price: 0.97, confidence: 0.94, timestamp: 1500 },
-      { price: 0.955, confidence: 0.90, timestamp: 2000 },
-      { price: 0.93, confidence: 0.85, timestamp: 2500 },
-      { price: 0.91, confidence: 0.80, timestamp: 3000 },
-      // Series 2: sharp depeg (the critical one)
-      { price: 0.99, confidence: 0.96, timestamp: 4000 },
-      { price: 0.975, confidence: 0.92, timestamp: 4200 },
-      { price: 0.94, confidence: 0.75, timestamp: 4300 },
-      { price: 0.87, confidence: 0.65, timestamp: 4400 },
-      { price: 0.82, confidence: 0.55, timestamp: 4500 },
-      { price: 0.79, confidence: 0.50, timestamp: 4600 },
-      // Series 3: recovery + volatility
-      { price: 0.85, confidence: 0.70, timestamp: 5000 },
-      { price: 0.88, confidence: 0.78, timestamp: 5200 },
-      { price: 0.905, confidence: 0.82, timestamp: 5500 },
-      { price: 0.94, confidence: 0.88, timestamp: 5800 },
-      { price: 0.96, confidence: 0.91, timestamp: 6100 },
+  private initializeHistoricalData() {
+    // Replay of last three JitoSOL depeg-style price series (synthetic but realistic)
+    const baseSlot = this.currentSlot - 2000;
+    const series: Array<{price: number, slotOffset: number}> = [
+      // Series 1: minor volatility
+      {price: 0.98, slotOffset: 0},
+      {price: 0.975, slotOffset: 25},
+      {price: 0.97, slotOffset: 60},
+      {price: 0.965, slotOffset: 120},
+      {price: 0.98, slotOffset: 300},
+      // Series 2: sharp depeg
+      {price: 0.92, slotOffset: 450},
+      {price: 0.85, slotOffset: 520},
+      {price: 0.78, slotOffset: 580},
+      {price: 0.75, slotOffset: 650},
+      {price: 0.88, slotOffset: 820},
+      // Series 3: prolonged depeg with recovery
+      {price: 0.82, slotOffset: 1100},
+      {price: 0.71, slotOffset: 1250},
+      {price: 0.68, slotOffset: 1380},
+      {price: 0.72, slotOffset: 1600},
+      {price: 0.95, slotOffset: 1950},
     ];
+
+    this.priceHistory = series.map((entry, i) => ({
+      price: entry.price,
+      confidence: 0.95 + (i % 5) * 0.01,
+      timestamp: Math.floor(Date.now() / 1000) - (2000 - entry.slotOffset) * 0.5,
+      slot: baseSlot + entry.slotOffset,
+    }));
+
+    // Ensure sorted by slot
+    this.priceHistory.sort((a, b) => a.slot - b.slot);
   }
 
-  getHistoricalJitoPrices(): HistoricalPriceSeries {
-    return this.historicalPrices;
+  async injectPriceAtSlot(slot: number, price: number, confidence: number = 0.98): Promise<void> {
+    const newPrice: PriceData = {
+      price,
+      confidence,
+      timestamp: Math.floor(Date.now() / 1000),
+      slot,
+    };
+    this.priceHistory.push(newPrice);
+    this.priceHistory.sort((a, b) => a.slot - b.slot);
+    if (slot > this.currentSlot) {
+      this.currentSlot = slot;
+    }
   }
 
-  injectLag(currentTime: number): PriceData {
-    this.currentSlot = Math.floor(currentTime / 500); // simulate slot time ~500ms
-
-    const laggedSlot = Math.max(0, this.currentSlot - this.lagSlots);
-    
-    // Find the most recent price before or at the lagged slot (by timestamp proxy)
-    let selected = this.historicalPrices[0];
-    for (const p of this.historicalPrices) {
-      if (p.timestamp <= laggedSlot * 500) {
-        selected = p;
+  async getCurrentPrice(): Promise<PriceData> {
+    // Return lagged price: find most recent price that is at least lagSlots behind currentSlot
+    const targetSlot = this.currentSlot - this.lagSlots;
+    let bestPrice = this.priceHistory[0];
+    for (const p of this.priceHistory) {
+      if (p.slot <= targetSlot) {
+        bestPrice = p;
       } else {
         break;
       }
     }
+    return { ...bestPrice };
+  }
 
+  getPriceHistory(): HistoricalPriceSeries {
+    // Find approximate depeg start (first price < 0.90)
+    let depegStartSlot = this.priceHistory[0].slot;
+    for (const p of this.priceHistory) {
+      if (p.price < 0.90) {
+        depegStartSlot = p.slot;
+        break;
+      }
+    }
     return {
-      price: selected.price,
-      confidence: selected.confidence,
-      timestamp: currentTime,
+      prices: [...this.priceHistory],
+      depegStartSlot,
     };
   }
 
-  advanceToNextTick(): void {
-    this.currentSlot += 2; // ~1s per tick
+  async advanceSlot(slots: number = 1): Promise<number> {
+    this.currentSlot += slots;
+    return this.currentSlot;
   }
 
-  reset(): void {
-    this.currentSlot = 0;
+  // Helper for test harness
+  getCurrentSlot(): number {
+    return this.currentSlot;
   }
 }
 
-// Factory for test compatibility
+// Factory for sim use
 export function createLagInjector(config: LagInjectorConfig): OracleLagInjector {
   return new LagInjector(config);
 }
-
-export { PriceData, HistoricalPriceSeries };
