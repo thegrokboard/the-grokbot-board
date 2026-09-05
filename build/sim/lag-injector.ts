@@ -1,127 +1,107 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
-import { OracleUtils, PriceData } from "./oracle-utils";
+import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
+import { PriceData, HistoricalPriceSeries, LagInjectorConfig } from "./oracle-utils";
+import { OracleUtils } from "./oracle-utils";
 
-export interface LagInjectorConfig {
-  oracleProgramId: PublicKey;
-  priceFeed: PublicKey;
-  lagSlots: number;
-  jitoSolMint: PublicKey;
-}
+export { PriceData, HistoricalPriceSeries, LagInjectorConfig };
 
-export interface HistoricalPriceSeries {
-  prices: PriceData[];
-  startSlot: number;
-  endSlot: number;
+export interface OracleConfig {
+  oraclePubkey: PublicKey;
+  programId: PublicKey;
 }
 
 export class LagInjector {
-  private config: LagInjectorConfig;
   private connection: Connection;
-  private oracleUtils: OracleUtils;
-  private currentLagOffset: number = 0;
-  private replaySeries: HistoricalPriceSeries | null = null;
+  private oracleProgramId: PublicKey;
+  private oraclePubkey: PublicKey;
+  private owner: Keypair;
+  private config: LagInjectorConfig;
 
-  constructor(config: LagInjectorConfig, connection: Connection) {
-    this.config = config;
+  constructor(
+    connection: Connection,
+    oracleConfig: OracleConfig,
+    owner: Keypair,
+    config: LagInjectorConfig
+  ) {
     this.connection = connection;
-    this.oracleUtils = new OracleUtils(connection, config.oracleProgramId);
+    this.oracleProgramId = oracleConfig.programId;
+    this.oraclePubkey = oracleConfig.oraclePubkey;
+    this.owner = owner;
+    this.config = config;
   }
 
-  async loadHistoricalSeries(): Promise<HistoricalPriceSeries> {
-    // Replay of last three known JitoSOL depeg price series (synthetic but realistic)
-    const baseSlot = 123456789;
-    const series: PriceData[] = [
-      { price: 0.95, confidence: 0.01, timestamp: 1690000000 },
-      { price: 0.94, confidence: 0.02, timestamp: 1690000030 },
-      { price: 0.92, confidence: 0.03, timestamp: 1690000060 },
-      { price: 0.85, confidence: 0.05, timestamp: 1690000120 },
-      { price: 0.78, confidence: 0.08, timestamp: 1690000180 },
-      { price: 0.75, confidence: 0.10, timestamp: 1690000240 },
-      { price: 0.82, confidence: 0.06, timestamp: 1690000300 },
-      { price: 0.88, confidence: 0.04, timestamp: 1690000360 },
-      { price: 0.91, confidence: 0.02, timestamp: 1690000420 },
-      { price: 0.96, confidence: 0.01, timestamp: 1690000480 },
-      // Second depeg wave
-      { price: 0.89, confidence: 0.03, timestamp: 1690100000 },
-      { price: 0.81, confidence: 0.07, timestamp: 1690100060 },
-      { price: 0.72, confidence: 0.12, timestamp: 1690100120 },
-      { price: 0.68, confidence: 0.15, timestamp: 1690100180 },
-      { price: 0.75, confidence: 0.09, timestamp: 1690100240 },
-      // Recovery
-      { price: 0.93, confidence: 0.02, timestamp: 1690200000 },
-      { price: 0.97, confidence: 0.01, timestamp: 1690200060 },
-      { price: 0.99, confidence: 0.005, timestamp: 1690200120 },
-      { price: 1.00, confidence: 0.001, timestamp: 1690200180 },
-    ];
+  async injectLag(series: HistoricalPriceSeries, currentSlot: number): Promise<void> {
+    const lagSlots = Math.floor(this.config.lagMs / 400);
+    const injectionSlot = Math.max(0, currentSlot - lagSlots);
 
-    this.replaySeries = {
-      prices: series,
-      startSlot: baseSlot,
-      endSlot: baseSlot + series.length * 8,
-    };
+    const relevantPrices = series.filter(p => p.slot <= injectionSlot);
 
-    return this.replaySeries;
-  }
-
-  async injectLaggedPrice(currentSlot: number): Promise<void> {
-    if (!this.replaySeries) {
-      await this.loadHistoricalSeries();
+    if (relevantPrices.length === 0) {
+      return;
     }
 
-    const series = this.replaySeries!;
-    const laggedSlot = Math.max(
-      series.startSlot,
-      currentSlot - this.config.lagSlots
-    );
+    const latest = relevantPrices[relevantPrices.length - 1];
 
-    const index = Math.min(
-      Math.floor((laggedSlot - series.startSlot) / 8),
-      series.prices.length - 1
-    );
-
-    const priceData = series.prices[index];
-
-    // Update on-chain oracle with lagged price (using test validator writable account simulation)
-    await this.oracleUtils.setTestPrice(
-      this.config.priceFeed,
-      priceData.price,
-      priceData.confidence,
-      priceData.timestamp
-    );
-
-    this.currentLagOffset = this.config.lagSlots;
+    await this.updateOracleWithPrice(latest.price, latest.confidence, latest.slot);
   }
 
-  getCurrentLagSlots(): number {
-    return this.currentLagOffset;
+  private async updateOracleWithPrice(price: number, confidence: number, slot: number): Promise<void> {
+    const priceBN = new anchor.BN(Math.floor(price * 1_000_000));
+    const confidenceBN = new anchor.BN(Math.floor(confidence * 1_000_000));
+
+    const ix = await OracleUtils.createUpdatePriceInstruction(
+      this.oraclePubkey,
+      this.oracleProgramId,
+      this.owner.publicKey,
+      priceBN,
+      confidenceBN,
+      slot
+    );
+
+    const tx = new anchor.web3.Transaction().add(ix);
+    tx.recentBlockhash = (await this.connection.getLatestBlockhash()).blockhash;
+    tx.feePayer = this.owner.publicKey;
+    tx.sign(this.owner);
+
+    await this.connection.sendRawTransaction(tx.serialize());
+    await this.connection.confirmTransaction(tx.signature!);
   }
 
-  async reset(): Promise<void> {
-    this.currentLagOffset = 0;
-    this.replaySeries = null;
+  static async setupTestOracle(
+    connection: Connection,
+    owner: Keypair
+  ): Promise<OracleConfig> {
+    const programId = new PublicKey("11111111111111111111111111111111");
+    const oracleKeypair = Keypair.generate();
+
+    const lamports = await connection.getMinimumBalanceForRentExemption(0);
+    const createIx = SystemProgram.createAccount({
+      fromPubkey: owner.publicKey,
+      newAccountPubkey: oracleKeypair.publicKey,
+      lamports,
+      space: 0,
+      programId,
+    });
+
+    const tx = new anchor.web3.Transaction().add(createIx);
+    tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+    tx.feePayer = owner.publicKey;
+    tx.sign(owner, oracleKeypair);
+
+    await connection.sendRawTransaction(tx.serialize());
+    await connection.confirmTransaction(tx.signature!);
+
+    return {
+      oraclePubkey: oracleKeypair.publicKey,
+      programId,
+    };
   }
 }
 
-// Utility for 45s target lag (approx 90 slots at 400ms/slot)
-export const DEFAULT_LAG_CONFIG: LagInjectorConfig = {
-  oracleProgramId: new PublicKey("11111111111111111111111111111111"),
-  priceFeed: new PublicKey("22222222222222222222222222222222"),
-  lagSlots: 90,
-  jitoSolMint: new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"),
-};
+export async function getHistoricalPriceSeries(): Promise<HistoricalPriceSeries> {
+  return OracleUtils.getHistoricalPriceSeries();
+}
 
-export async function createLagInjector(
-  provider: anchor.Provider,
-  config: Partial<LagInjectorConfig> = {}
-): Promise<LagInjector> {
-  const fullConfig: LagInjectorConfig = {
-    ...DEFAULT_LAG_CONFIG,
-    ...config,
-    oracleProgramId: config.oracleProgramId || DEFAULT_LAG_CONFIG.oracleProgramId,
-    priceFeed: config.priceFeed || DEFAULT_LAG_CONFIG.priceFeed,
-    jitoSolMint: config.jitoSolMint || DEFAULT_LAG_CONFIG.jitoSolMint,
-  };
-
-  return new LagInjector(fullConfig, provider.connection);
+export function createLagInjectorConfig(lagMs: number = 45000): LagInjectorConfig {
+  return OracleUtils.createLagInjectorConfig(lagMs);
 }
