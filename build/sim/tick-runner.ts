@@ -1,137 +1,122 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
-import { PublicKey, Connection, Keypair } from "@solana/web3.js";
+import { Program, AnchorProvider, Wallet } from "@coral-xyz/anchor";
+import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 import { Vault } from "../target/types/vault";
-import { LagInjector } from "./lag-injector";
-import { checkTWAPFalsePositive } from "./twap-checker";
+import { LagInjector, HistoricalPriceSeries, OracleConfig } from "./lag-injector";
 import { getHistoricalPriceSeries } from "./oracle-utils";
+import { checkTWAPFalsePositive } from "./twap-checker";
 
-interface SimConfig {
-  lagSeconds: number;
-  twapPeriodSeconds: number;
-  depegThresholdBps: number;
-  replaySeriesCount: number;
-  tickIntervalMs: number;
-}
-
-const CONFIG: SimConfig = {
-  lagSeconds: 45,
-  twapPeriodSeconds: 15,
-  depegThresholdBps: 500,
-  replaySeriesCount: 3,
-  tickIntervalMs: 15000,
-};
+const LAG_TARGET_SLOTS = 150; // ~45s at 300ms/slot
+const TICK_INTERVAL_MS = 15000; // 15s ticks for TWAP check
+const SIM_DAYS = 7;
+const TICKS_PER_DAY = (24 * 3600 * 1000) / TICK_INTERVAL_MS;
+const TOTAL_TICKS = SIM_DAYS * TICKS_PER_DAY;
 
 async function main() {
-  const provider = anchor.AnchorProvider.env();
+  // Setup provider
+  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
+  const wallet = new Wallet(Keypair.generate()); // funded by test validator in practice
+  const provider = new AnchorProvider(connection, wallet, { commitment: "confirmed" });
   anchor.setProvider(provider);
 
-  const program = new Program<Vault>(
-    require("../target/idl/vault.json"),
-    provider
-  );
+  const programId = new PublicKey("Vault111111111111111111111111111111111111111");
+  const program = new Program<Vault>(programId, provider);
 
-  const connection = provider.connection;
-  const payer = (provider.wallet as anchor.Wallet).payer;
+  // Setup vault accounts (minimal for sim)
+  const vault = Keypair.generate();
+  const protectionBuffer = Keypair.generate();
+  const jitoMint = new PublicKey("JitoSOL111111111111111111111111111111111");
 
-  console.log("Starting pure-onchain Anchor JitoSOL depeg sim harness...");
-
-  // Load historical JitoSOL price series (last 3 depeg events)
-  const seriesList: any[] = await getHistoricalPriceSeries(CONFIG.replaySeriesCount);
-  console.log(`Loaded ${seriesList.length} historical price series for replay.`);
-
-  const injector = new LagInjector(connection, {
-    lagSeconds: CONFIG.lagSeconds,
-    oracleProgramId: new PublicKey("oracle111111111111111111111111111111111111111"),
-    priceFeedPubkey: new PublicKey("price111111111111111111111111111111111111111"),
-  });
-
-  // Setup on-chain vault accounts
-  const vaultKeypair = Keypair.generate();
-  const bufferKeypair = Keypair.generate();
-  const owner = payer;
-
-  console.log("Initializing vault and protection buffer...");
+  console.log("Initializing vault for simulation...");
   await program.methods
-    .initialize(owner.publicKey, new anchor.BN(1000)) // example buffer size in lamports
+    .initialize(new anchor.BN(1000)) // buffer threshold example
     .accounts({
-      vault: vaultKeypair.publicKey,
-      protectionBuffer: bufferKeypair.publicKey,
-      owner: owner.publicKey,
-      systemProgram: anchor.web3.SystemProgram.programId,
+      vault: vault.publicKey,
+      protectionBuffer: protectionBuffer.publicKey,
+      owner: wallet.publicKey,
+      jitoMint,
+      systemProgram: SystemProgram.programId,
     })
-    .signers([vaultKeypair, bufferKeypair])
+    .signers([vault, protectionBuffer])
     .rpc();
 
-  console.log("Vault initialized. Starting 7-day tick simulation (replay mode)...");
-
-  let tickCount = 0;
-  const maxTicks = 7 * 24 * 60 * 4; // ~7 days at 15s ticks
-  let breakerTrips = 0;
-  let falsePositives = 0;
-
-  const runTick = async () => {
-    if (tickCount >= maxTicks) {
-      console.log("\nSimulation complete.");
-      console.log(`Breaker trips: ${breakerTrips}`);
-      console.log(`False positives (TWAP): ${falsePositives}`);
-      process.exit(0);
-    }
-
-    const seriesIndex = tickCount % seriesList.length;
-    const currentSeries = seriesList[seriesIndex];
-
-    // Inject lagged price at current simulated slot time
-    const simulatedTimestamp = Date.now() / 1000;
-    await injector.injectLaggedPrice(currentSeries, simulatedTimestamp);
-
-    // Run TWAP false-positive checker on the injected series
-    const recentPrices = currentSeries.prices.slice(0, 10); // last N points for TWAP
-    const isFalsePositive = checkTWAPFalsePositive(recentPrices, CONFIG.twapPeriodSeconds, CONFIG.depegThresholdBps);
-
-    if (isFalsePositive) {
-      falsePositives++;
-      console.log(`Tick ${tickCount}: TWAP false positive detected (no breaker trip).`);
-    } else {
-      // Trigger on-chain drawdown circuit breaker if real depeg
-      try {
-        await program.methods
-          .triggerDrawdown()
-          .accounts({
-            vault: vaultKeypair.publicKey,
-            protectionBuffer: bufferKeypair.publicKey,
-            owner: owner.publicKey,
-            priceOracle: injector.getPriceFeedPubkey(),
-          })
-          .rpc();
-        breakerTrips++;
-        console.log(`Tick ${tickCount}: CIRCUIT BREAKER TRIPPED (drawdown triggered).`);
-      } catch (err) {
-        console.log(`Tick ${tickCount}: Breaker already tripped or instruction failed.`);
-      }
-    }
-
-    tickCount++;
+  // Oracle config with lag
+  const oracleConfig: OracleConfig = {
+    oraclePubkey: new PublicKey("Oracle1111111111111111111111111111111111111"),
+    lagSlots: LAG_TARGET_SLOTS,
+    basePrice: 1.0,
   };
 
-  // Drive simulation with 15s ticks
-  const interval = setInterval(async () => {
-    await runTick();
-  }, CONFIG.tickIntervalMs);
+  const lagInjector = new LagInjector(provider.connection, oracleConfig);
 
-  // Allow graceful shutdown
-  process.on("SIGINT", () => {
-    clearInterval(interval);
-    console.log("\nSimulation stopped by user.");
-    console.log(`Final stats - Breaker trips: ${breakerTrips}, False positives: ${falsePositives}`);
-    process.exit(0);
-  });
+  // Replay last three Jito depeg series
+  console.log("Fetching historical JitoSOL price series...");
+  const series1 = await getHistoricalPriceSeries("jito-depeg-1");
+  const series2 = await getHistoricalPriceSeries("jito-depeg-2");
+  const series3 = await getHistoricalPriceSeries("jito-depeg-3");
+  const allSeries: HistoricalPriceSeries[] = [series1, series2, series3];
 
-  // Run first tick immediately
-  await runTick();
+  let breakerTrips = 0;
+  let falsePositives = 0;
+  let tick = 0;
+
+  console.log(`Starting ${SIM_DAYS}-day simulation with ${TOTAL_TICKS} ticks...`);
+
+  for (const priceSeries of allSeries) {
+    await lagInjector.injectSeries(priceSeries);
+
+    for (let i = 0; i < priceSeries.length; i += Math.floor(priceSeries.length / TICKS_PER_DAY)) {
+      if (tick >= TOTAL_TICKS) break;
+
+      const currentPrice = priceSeries[i];
+      const timestamp = Date.now() / 1000;
+
+      // Simulate on-chain price update with lag
+      await lagInjector.updateOracleWithLag(currentPrice, new anchor.BN(timestamp));
+
+      // Run 15s TWAP false-positive checker
+      const isFalsePositive = checkTWAPFalsePositive(
+        priceSeries.slice(0, i + 1),
+        15,
+        0.05 // 5% drawdown threshold
+      );
+
+      if (isFalsePositive) {
+        falsePositives++;
+        console.log(`Tick ${tick}: TWAP false positive detected`);
+      }
+
+      // Check circuit breaker on-chain
+      try {
+        await program.methods
+          .checkDrawdown()
+          .accounts({
+            vault: vault.publicKey,
+            protectionBuffer: protectionBuffer.publicKey,
+            oracle: oracleConfig.oraclePubkey,
+          })
+          .rpc();
+        console.log(`Tick ${tick}: No breaker trip`);
+      } catch (err: any) {
+        if (err.toString().includes("DrawdownBreached")) {
+          breakerTrips++;
+          console.log(`Tick ${tick}: BREAKER TRIPPED`);
+        }
+      }
+
+      tick++;
+      // Simulate tick interval
+      await new Promise((resolve) => setTimeout(resolve, TICK_INTERVAL_MS / 10)); // speed up sim
+    }
+  }
+
+  console.log("\nSimulation complete!");
+  console.log(`Breaker trips: ${breakerTrips}`);
+  console.log(`False positives: ${falsePositives}`);
+  console.log(`False positive rate: ${((falsePositives / (breakerTrips || 1)) * 100).toFixed(2)}%`);
 }
 
 main().catch((err) => {
-  console.error("Simulation failed:", err);
+  console.error(err);
   process.exit(1);
 });
