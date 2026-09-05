@@ -1,119 +1,91 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { LagInjector, LagInjectorConfig } from "./lag-injector";
+import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { LagInjector, LagInjectorConfig, PriceData } from "./lag-injector";
 import { checkTWAPFalsePositive } from "./twap-checker";
-import { getHistoricalJitoPrices, PriceData } from "./oracle-utils";
-import * as fs from "fs";
-import * as path from "path";
+import { getHistoricalJitoPrices } from "./oracle-utils";
 
-interface SimulationResult {
-  breakerTrips: number;
-  falsePositives: number;
-  totalTicks: number;
-  logPath: string;
-}
-
-const TICK_INTERVAL_MS = 15000; // 15s ticks
-const TOTAL_SIM_DURATION_DAYS = 7;
-const MS_PER_DAY = 86400000;
-const TOTAL_TICKS = Math.floor((TOTAL_SIM_DURATION_DAYS * MS_PER_DAY) / TICK_INTERVAL_MS);
-
-async function runSimulation(): Promise<SimulationResult> {
-  console.log("Starting 7-day JitoSOL depeg simulation...");
-
-  const connection = new Connection("http://127.0.0.1:8899", "confirmed");
-  
-  // Load historical price series (real Jito depeg events)
-  const historicalSeries: PriceData[] = getHistoricalJitoPrices();
-  console.log(`Loaded ${historicalSeries.length} historical price points`);
-
-  const config: LagInjectorConfig = {
-    targetLagMs: 45000, // 45s target oracle lag
-    slotMs: 400,        // approximate slot time
-    replaySpeed: 1.0
-  };
-
-  const injector = new LagInjector(config);
-  await injector.loadSeries(historicalSeries);
-
-  const logs: string[] = [];
-  let breakerTrips = 0;
-  let falsePositives = 0;
-  let currentTick = 0;
-  let simTimeMs = 0;
-
-  const logPath = path.join(__dirname, "sim-logs", `run_${Date.now()}.log`);
-  if (!fs.existsSync(path.dirname(logPath))) {
-    fs.mkdirSync(path.dirname(logPath), { recursive: true });
-  }
-
-  console.log(`Running ${TOTAL_TICKS} ticks (${TOTAL_SIM_DURATION_DAYS} days @ 15s resolution)...`);
-
-  while (currentTick < TOTAL_TICKS) {
-    const laggedPrice = injector.getCurrentPrice(simTimeMs);
-    
-    if (laggedPrice) {
-      const isFalsePositive = checkTWAPFalsePositive(
-        historicalSeries,
-        laggedPrice,
-        0.05, // 5% drawdown threshold
-        4     // 4-tick TWAP window
-      );
-
-      const shouldTripBreaker = laggedPrice.price < 0.92; // example circuit breaker threshold
-
-      if (shouldTripBreaker) {
-        breakerTrips++;
-        logs.push(`[TICK ${currentTick}] BREWER TRIP at price=${laggedPrice.price.toFixed(4)} (slot ~${laggedPrice.slot})`);
-      } else if (isFalsePositive) {
-        falsePositives++;
-        logs.push(`[TICK ${currentTick}] FALSE POSITIVE detected at price=${laggedPrice.price.toFixed(4)}`);
-      }
-    }
-
-    simTimeMs += TICK_INTERVAL_MS;
-    currentTick++;
-
-    if (currentTick % 500 === 0) {
-      console.log(`Progress: ${((currentTick / TOTAL_TICKS) * 100).toFixed(1)}% - Trips: ${breakerTrips}, False Pos: ${falsePositives}`);
-    }
-  }
-
-  logs.unshift(`=== JitoSOL Vault Simulation Report ===`);
-  logs.unshift(`Duration: ${TOTAL_SIM_DURATION_DAYS} days`);
-  logs.unshift(`Ticks: ${TOTAL_TICKS}`);
-  logs.unshift(`Breaker trips: ${breakerTrips}`);
-  logs.unshift(`False positives: ${falsePositives}`);
-  logs.unshift(`False positive rate: ${((falsePositives / (breakerTrips + falsePositives)) * 100 || 0).toFixed(2)}%`);
-  logs.push(`=== End of simulation ===`);
-
-  fs.writeFileSync(logPath, logs.join("\n"));
-  console.log(`Simulation complete. Log written to ${logPath}`);
-
-  return {
-    breakerTrips,
-    falsePositives,
-    totalTicks: TOTAL_TICKS,
-    logPath
-  };
-}
+const TARGET_LAG_MS = 45_000;
+const TICK_INTERVAL_MS = 15_000;
+const SIM_DURATION_DAYS = 7;
+const MS_PER_DAY = 86_400_000;
 
 async function main() {
-  try {
-    const result = await runSimulation();
-    console.log("\n=== SIMULATION SUMMARY ===");
-    console.log(`Breaker trips: ${result.breakerTrips}`);
-    console.log(`False positives: ${result.falsePositives}`);
-    console.log(`Total ticks: ${result.totalTicks}`);
-    console.log(`Log: ${result.logPath}`);
-    
-    if (result.falsePositives > 3) {
-      console.warn("WARNING: High false positive count - TWAP parameters may need tuning");
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const connection = provider.connection;
+  const payer = (provider.wallet as anchor.Wallet).payer;
+
+  console.log("=== JitoSOL Depeg Protection Sim Harness ===");
+  console.log(`Target oracle lag: ${TARGET_LAG_MS}ms`);
+  console.log(`TWAP window: 15s`);
+  console.log(`Simulation duration: ${SIM_DURATION_DAYS} days\n`);
+
+  const config: LagInjectorConfig = {
+    targetLagMs: TARGET_LAG_MS,
+    slotMs: 400,
+  };
+
+  const injector = new LagInjector(connection, payer, config);
+
+  const series: PriceData[] = await getHistoricalJitoPrices();
+  await injector.loadSeries(series);
+
+  console.log(`Loaded ${series.length} historical JitoSOL price points.\n`);
+  console.log("Starting 15s-tick simulation...\n");
+
+  const startTime = Date.now();
+  const endTime = startTime + SIM_DURATION_DAYS * MS_PER_DAY;
+  let tick = 0;
+  let breakerTrips = 0;
+  let falsePositives = 0;
+
+  let lastLogTime = Date.now();
+
+  while (Date.now() < endTime) {
+    const now = Date.now();
+    const currentPrice = injector.getCurrentPrice(now);
+
+    const isFalsePositive = checkTWAPFalsePositive(
+      injector,
+      now,
+      15_000,
+      0.05 // 5% drawdown threshold for breaker
+    );
+
+    if (isFalsePositive) {
+      falsePositives++;
     }
-  } catch (err) {
-    console.error("Simulation failed:", err);
-    process.exit(1);
+
+    // Simulate drawdown circuit-breaker trip on real depeg (simple proxy)
+    if (currentPrice && currentPrice.price < 0.90) {
+      breakerTrips++;
+      console.log(`[${new Date(now).toISOString()}] BREAKER TRIP - price ${currentPrice.price.toFixed(4)}`);
+    }
+
+    tick++;
+
+    // Progress log every 10 simulated ticks (~2.5 min wall time in sim)
+    if (now - lastLogTime > 150_000) {
+      const progress = Math.round(((now - startTime) / (endTime - startTime)) * 100);
+      console.log(`[${new Date(now).toISOString()}] tick ${tick} | progress ${progress}% | trips ${breakerTrips} | falsePos ${falsePositives}`);
+      lastLogTime = now;
+    }
+
+    // Advance simulated time by one tick
+    await new Promise((resolve) => setTimeout(resolve, 10)); // fast-forward sim
   }
+
+  const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log("\n=== Simulation Complete ===");
+  console.log(`Ticks simulated: ${tick}`);
+  console.log(`Wall time: ${durationSec}s`);
+  console.log(`Circuit-breaker trips: ${breakerTrips}`);
+  console.log(`15s-TWAP false positives: ${falsePositives}`);
+  console.log(`False-positive rate: ${((falsePositives / tick) * 100).toFixed(3)}%`);
 }
 
-main();
+main().catch((err) => {
+  console.error("Simulation failed:", err);
+  process.exit(1);
+});
