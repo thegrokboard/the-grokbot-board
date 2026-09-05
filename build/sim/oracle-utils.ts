@@ -1,106 +1,109 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair } from "@solana/web3.js";
 
 export interface PriceData {
   price: number;
-  confidence: number;
   timestamp: number;
 }
 
 export interface HistoricalPriceSeries {
   prices: PriceData[];
   startSlot: number;
-  startTimestamp: number;
+  endSlot: number;
 }
 
 export interface LagInjectorConfig {
   oraclePubkey: PublicKey;
   lagSlots: number;
-  replaySeries: HistoricalPriceSeries;
-  updateIntervalMs: number;
+  basePrice: number;
+  series: HistoricalPriceSeries;
 }
 
-export function getHistoricalPriceSeries(): HistoricalPriceSeries {
-  // Real JitoSOL depeg price series (approximated from public May 2024 incident data)
-  // Prices in USD, timestamps in seconds since epoch, confidence fixed at 0.01
-  const baseTimestamp = Math.floor(Date.now() / 1000) - 3600 * 24 * 7; // 7 days ago
-  const baseSlot = 280_000_000; // arbitrary recent mainnet slot
+export class OracleUtils {
+  private connection: Connection;
+  private program: any; // Anchor program
 
-  const prices: PriceData[] = [
-    { price: 0.98, confidence: 0.01, timestamp: baseTimestamp + 0 },
-    { price: 0.975, confidence: 0.01, timestamp: baseTimestamp + 45 },
-    { price: 0.96, confidence: 0.01, timestamp: baseTimestamp + 90 },
-    { price: 0.94, confidence: 0.01, timestamp: baseTimestamp + 135 },
-    { price: 0.91, confidence: 0.01, timestamp: baseTimestamp + 180 },
-    { price: 0.87, confidence: 0.01, timestamp: baseTimestamp + 225 },
-    { price: 0.82, confidence: 0.01, timestamp: baseTimestamp + 270 },
-    { price: 0.79, confidence: 0.01, timestamp: baseTimestamp + 315 },
-    { price: 0.76, confidence: 0.01, timestamp: baseTimestamp + 360 },
-    { price: 0.74, confidence: 0.01, timestamp: baseTimestamp + 405 },
-    { price: 0.73, confidence: 0.01, timestamp: baseTimestamp + 450 },
-    { price: 0.72, confidence: 0.01, timestamp: baseTimestamp + 495 },
-    { price: 0.71, confidence: 0.01, timestamp: baseTimestamp + 540 },
-    { price: 0.705, confidence: 0.01, timestamp: baseTimestamp + 585 },
-    { price: 0.70, confidence: 0.01, timestamp: baseTimestamp + 630 },
-    { price: 0.71, confidence: 0.01, timestamp: baseTimestamp + 675 },
-    { price: 0.73, confidence: 0.01, timestamp: baseTimestamp + 720 },
-    { price: 0.76, confidence: 0.01, timestamp: baseTimestamp + 765 },
-    { price: 0.79, confidence: 0.01, timestamp: baseTimestamp + 810 },
-    { price: 0.83, confidence: 0.01, timestamp: baseTimestamp + 855 },
-    { price: 0.87, confidence: 0.01, timestamp: baseTimestamp + 900 },
-    { price: 0.91, confidence: 0.01, timestamp: baseTimestamp + 945 },
-    { price: 0.94, confidence: 0.01, timestamp: baseTimestamp + 990 },
-    { price: 0.96, confidence: 0.01, timestamp: baseTimestamp + 1035 },
-    { price: 0.975, confidence: 0.01, timestamp: baseTimestamp + 1080 },
-    { price: 0.98, confidence: 0.01, timestamp: baseTimestamp + 1125 },
-  ];
+  constructor(connection: Connection, program: any) {
+    this.connection = connection;
+    this.program = program;
+  }
 
-  return {
-    prices,
-    startSlot: baseSlot,
-    startTimestamp: baseTimestamp,
-  };
-}
+  static createHistoricalSeries(prices: number[], startSlot: number = 0): HistoricalPriceSeries {
+    const priceData: PriceData[] = prices.map((price, index) => ({
+      price,
+      timestamp: Date.now() + index * 15000, // 15s intervals
+    }));
+    return {
+      prices: priceData,
+      startSlot,
+      endSlot: startSlot + prices.length * 15, // rough slot estimate
+    };
+  }
 
-export function createLagInjectorConfig(
-  oraclePubkey: PublicKey,
-  lagSeconds: number = 45
-): LagInjectorConfig {
-  const series = getHistoricalPriceSeries();
-  return {
-    oraclePubkey,
-    lagSlots: Math.floor((lagSeconds * 2)), // rough 2 slots per second on devnet
-    replaySeries: series,
-    updateIntervalMs: 15000, // 15s updates
-  };
-}
-
-export async function updateOracleWithLag(
-  connection: Connection,
-  config: LagInjectorConfig,
-  currentSlot: number,
-  program?: anchor.Program
-): Promise<void> {
-  const lagOffset = config.lagSlots;
-  const targetSlot = Math.max(currentSlot - lagOffset, config.replaySeries.startSlot);
-  
-  // Find closest price point by slot
-  let closest = config.replaySeries.prices[0];
-  let minDiff = Infinity;
-  
-  for (const p of config.replaySeries.prices) {
-    const slotEstimate = config.replaySeries.startSlot + 
-      Math.floor((p.timestamp - config.replaySeries.startTimestamp) / 0.4); // ~2.5s per slot
-    const diff = Math.abs(slotEstimate - targetSlot);
-    if (diff < minDiff) {
-      minDiff = diff;
-      closest = p;
+  async injectSeries(config: LagInjectorConfig, wallet: Keypair): Promise<void> {
+    // In sim, we update the on-chain oracle account with lagged values
+    for (let i = 0; i < config.series.prices.length; i++) {
+      const laggedIndex = Math.max(0, i - Math.floor(config.lagSlots / 15));
+      const price = config.series.prices[laggedIndex].price;
+      
+      await this.updateOraclePrice(config.oraclePubkey, price, wallet);
+      // Advance simulated time (in real test validator this would use setBlockTime)
+      await new Promise(resolve => setTimeout(resolve, 50)); // simulate slot time
     }
   }
 
-  // In a real sim this would call the oracle update instruction.
-  // For the harness we just log (the test validator sim will observe this price).
-  console.log(`[LagInjector] Slot ${currentSlot} -> lagged price $${closest.price.toFixed(3)} (lag ~${lagOffset} slots)`);
-  
-  // If program is provided we could CPI, but for pure-onchain test harness this is sufficient.
+  async updateOraclePrice(oraclePubkey: PublicKey, price: number, wallet: Keypair): Promise<void> {
+    // Simulate oracle update via program instruction (vault program owns or proxies oracle)
+    await this.program.methods
+      .updateOracle(new anchor.BN(Math.floor(price * 1_000_000))) // 6 decimals
+      .accounts({
+        oracle: oraclePubkey,
+        authority: wallet.publicKey,
+      })
+      .signers([wallet])
+      .rpc();
+  }
+
+  static checkTWAPFalsePositive(series: HistoricalPriceSeries, twapPeriodSlots: number = 15 * 60): boolean {
+    if (series.prices.length < 2) return false;
+    
+    // Simple TWAP calculation over last N points
+    const period = Math.min(twapPeriodSlots / 15, series.prices.length);
+    const recentPrices = series.prices.slice(-period);
+    const twap = recentPrices.reduce((sum, p) => sum + p.price, 0) / recentPrices.length;
+    const lastPrice = recentPrices[recentPrices.length - 1].price;
+    
+    // False positive if TWAP > 5% from spot while in recovery (simplified)
+    const deviation = Math.abs(lastPrice - twap) / twap;
+    return deviation > 0.05 && lastPrice > twap * 0.9; // example false-positive condition
+  }
+
+  getLagAdjustedPrice(series: HistoricalPriceSeries, lagSlots: number, currentIndex: number): number {
+    const lagSteps = Math.floor(lagSlots / 15); // assuming 15s slots for sim
+    const laggedIndex = Math.max(0, currentIndex - lagSteps);
+    return series.prices[laggedIndex].price;
+  }
 }
+
+// Default config factory for Jito depeg replay
+export function createJitoDepegSeries(): HistoricalPriceSeries {
+  // Replay of last three known JitoSOL depeg price drops (simulated values)
+  const depegPrices = [
+    0.98, 0.97, 0.95, 0.92, 0.89, 0.85, 0.82, 0.80, 0.78, // first depeg
+    0.79, 0.81, 0.84, 0.88, 0.91, 0.93,                     // partial recovery
+    0.90, 0.87, 0.83, 0.79, 0.75, 0.71, 0.68, 0.65, 0.62, // second depeg
+    0.64, 0.67, 0.72, 0.78, 0.85, 0.89,                     // recovery
+    0.88, 0.86, 0.82, 0.77, 0.73, 0.70, 0.68, 0.67, 0.66, // third depeg
+    0.67, 0.69, 0.72, 0.76, 0.81, 0.87, 0.92
+  ];
+  return {
+    prices: depegPrices.map((p, i) => ({
+      price: p,
+      timestamp: Date.now() - (depegPrices.length - i) * 15000,
+    })),
+    startSlot: 100000,
+    endSlot: 100000 + depegPrices.length * 15,
+  };
+}
+
+export default OracleUtils;
