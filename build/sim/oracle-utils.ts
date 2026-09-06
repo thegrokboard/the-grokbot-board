@@ -1,5 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 
 export interface PriceData {
   price: number;
@@ -7,98 +7,72 @@ export interface PriceData {
 }
 
 export interface HistoricalPriceSeries {
-  prices: PriceData[];
   mint: string;
+  prices: PriceData[];
 }
 
 export interface LagInjectorConfig {
-  lagSlots: number;
-  oracleProgramId: PublicKey;
-  oracleAccount: PublicKey;
-  targetLagMs: number;
+  lagMs: number;
+  slotMs: number;
 }
 
 export interface OracleConfig {
-  oracleAccount: PublicKey;
-  oracleProgramId: PublicKey;
-  updateFrequency: number;
+  oraclePubkey: PublicKey;
+  mint: PublicKey;
+  updateInterval: number;
 }
 
 export class OracleUtils {
-  static createUpdatePriceInstruction(
-    oracleProgramId: PublicKey,
-    oracleAccount: PublicKey,
-    priceData: PriceData
-  ): TransactionInstruction {
-    // Placeholder for Pyth/Switchboard update instruction; in test harness this is a no-op that logs the update
-    return new TransactionInstruction({
-      keys: [{ pubkey: oracleAccount, isSigner: false, isWritable: true }],
-      programId: oracleProgramId,
-      data: Buffer.from(JSON.stringify(priceData)),
-    });
+  static createLagInjectorConfig(lagMs: number = 45000, slotMs: number = 400): LagInjectorConfig {
+    return { lagMs, slotMs };
   }
 
-  static async fetchHistoricalSeries(
-    connection: Connection,
-    mint: string,
-    limit: number = 1000
-  ): Promise<HistoricalPriceSeries> {
-    // For the sim harness we return deterministic JitoSOL depeg series
-    // Three example depeg events (price in USD)
-    const basePrices: PriceData[] = [
-      { price: 1.00, timestamp: Date.now() - 3600000 },
-      { price: 0.98, timestamp: Date.now() - 2700000 },
-      { price: 0.95, timestamp: Date.now() - 1800000 },
-      { price: 0.92, timestamp: Date.now() - 900000 },
-      { price: 0.89, timestamp: Date.now() - 600000 },
-      { price: 0.87, timestamp: Date.now() - 300000 },
-      { price: 0.85, timestamp: Date.now() - 120000 },
-      { price: 0.84, timestamp: Date.now() - 60000 },
-      { price: 0.83, timestamp: Date.now() - 30000 },
-      { price: 1.00, timestamp: Date.now() },
-    ];
-
-    // Duplicate and shift for three distinct series
-    const series1 = basePrices.map((p, i) => ({
-      price: p.price * (1 - i * 0.005),
-      timestamp: p.timestamp + i * 15000,
-    }));
-
-    const series2 = basePrices.map((p, i) => ({
-      price: Math.max(0.75, p.price - 0.12 + Math.sin(i) * 0.03),
-      timestamp: p.timestamp + 45000 + i * 15000,
-    }));
-
-    const series3 = basePrices.map((p, i) => ({
-      price: p.price * 0.91 + (i % 3 === 0 ? -0.04 : 0.02),
-      timestamp: p.timestamp + 90000 + i * 15000,
-    }));
-
-    const allPrices = [...series1, ...series2, ...series3]
-      .sort((a, b) => a.timestamp - b.timestamp)
-      .slice(0, limit);
-
-    return {
-      prices: allPrices,
-      mint,
-    };
+  static getHistoricalPriceSeries(mint: string, prices: PriceData[]): HistoricalPriceSeries {
+    return { mint, prices };
   }
 
-  static getHistoricalPriceSeries(series: HistoricalPriceSeries, startIndex: number, count: number): PriceData[] {
-    if (!series || !series.prices) return [];
-    const end = Math.min(startIndex + count, series.prices.length);
-    return series.prices.slice(startIndex, end);
+  static filterSeries(series: HistoricalPriceSeries, startTime: number, endTime: number): PriceData[] {
+    return series.prices.filter(p => p.timestamp >= startTime && p.timestamp <= endTime);
   }
 
-  static calculateTWAP(prices: PriceData[], windowSeconds: number = 15): number {
-    if (prices.length === 0) return 0;
-    const now = prices[prices.length - 1].timestamp;
-    const cutoff = now - windowSeconds * 1000;
-    const windowPrices = prices.filter(p => p.timestamp >= cutoff);
-    if (windowPrices.length === 0) return prices[prices.length - 1].price;
-    const sum = windowPrices.reduce((acc, p) => acc + p.price, 0);
-    return sum / windowPrices.length;
+  static toSlot(timestamp: number, slotMs: number): number {
+    return Math.floor(timestamp / slotMs);
+  }
+
+  static createOracleConfig(oraclePubkey: PublicKey, mint: PublicKey, updateInterval: number = 15): OracleConfig {
+    return { oraclePubkey, mint, updateInterval };
   }
 }
 
-export default OracleUtils;
+export function checkTWAPFalsePositive(prices: PriceData[], twapPeriodMs: number = 15000): boolean {
+  if (prices.length < 2) return false;
+  const sorted = [...prices].sort((a, b) => a.timestamp - b.timestamp);
+  const start = sorted[0].timestamp;
+  const end = sorted[sorted.length - 1].timestamp;
+  if (end - start < twapPeriodMs) return false;
+
+  let sum = 0;
+  let count = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    if (sorted[i].timestamp <= start + twapPeriodMs) {
+      sum += sorted[i].price;
+      count++;
+    } else {
+      break;
+    }
+  }
+  const twap = count > 0 ? sum / count : 0;
+  const lastPrice = sorted[sorted.length - 1].price;
+  return Math.abs(lastPrice - twap) / twap > 0.05; // 5% deviation threshold for false-positive test
+}
+
+export async function simulateOracleUpdate(
+  provider: anchor.AnchorProvider,
+  oraclePubkey: PublicKey,
+  price: number,
+  timestamp: number
+): Promise<void> {
+  // In test validator sim this is a no-op placeholder that logs (real impl would call a mock oracle program)
+  console.log(`[SIM] Oracle update: ${oraclePubkey.toBase58()} price=${price} ts=${timestamp}`);
+  // No actual transaction in this harness; lag injector drives timing
+}
