@@ -1,6 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection, Keypair } from "@solana/web3.js";
-import { Program } from "@coral-xyz/anchor";
+import { PublicKey, Connection, Keypair, TransactionInstruction, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
+import BN from "bn.js";
 
 export interface PriceData {
   price: number;
@@ -10,146 +10,118 @@ export interface PriceData {
 export interface HistoricalPriceSeries {
   prices: PriceData[];
   startSlot: number;
-  slotInterval: number;
+  endSlot: number;
 }
 
 export interface LagInjectorConfig {
+  lagMs: number;
   lagSlots: number;
-  targetLagSeconds: number;
-  series: HistoricalPriceSeries[];
+  oraclePubkey: PublicKey;
+  payer: Keypair;
 }
 
 export interface OracleConfig {
-  lagSlots: number;
-  updateInterval: number;
+  oraclePubkey: PublicKey;
+  updateFrequencyMs: number;
 }
 
 export class OracleUtils {
-  static createPriceData(price: number, timestamp: number): PriceData {
-    return { price, timestamp };
+  static createHistoricalPriceSeries(prices: PriceData[], startSlot: number = 0): HistoricalPriceSeries {
+    const endSlot = startSlot + prices.length;
+    return {
+      prices,
+      startSlot,
+      endSlot,
+    };
   }
 
-  static createHistoricalPriceSeries(
-    prices: PriceData[],
-    startSlot: number,
-    slotInterval: number
-  ): HistoricalPriceSeries {
-    return { prices, startSlot, slotInterval };
+  static getHistoricalPriceSeries(series: HistoricalPriceSeries, startIdx: number = 0, count?: number): PriceData[] {
+    const end = count !== undefined ? startIdx + count : series.prices.length;
+    return series.prices.slice(startIdx, end);
   }
 
-  static createLagInjectorConfig(
-    lagSlots: number,
-    targetLagSeconds: number,
-    series: HistoricalPriceSeries[]
-  ): LagInjectorConfig {
-    return { lagSlots, targetLagSeconds, series };
+  static createUpdatePriceInstruction(
+    oraclePubkey: PublicKey,
+    priceData: PriceData,
+    payer: PublicKey
+  ): TransactionInstruction {
+    // Stub instruction for local test validator oracle (in real sim this would target a mock price account)
+    const data = Buffer.from([
+      1, // update discriminator
+      ...new BN(Math.floor(priceData.price * 1_000_000)).toArray("le", 8),
+      ...new BN(priceData.timestamp).toArray("le", 8),
+    ]);
+
+    return new TransactionInstruction({
+      keys: [
+        { pubkey: oraclePubkey, isSigner: false, isWritable: true },
+        { pubkey: payer, isSigner: true, isWritable: true },
+        { pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: false },
+      ],
+      programId: new PublicKey("11111111111111111111111111111111"), // mock oracle program
+      data,
+    });
   }
 
-  static createOracleConfig(lagSlots: number, updateInterval: number): OracleConfig {
-    return { lagSlots, updateInterval };
-  }
-
-  static calculateTWAP(prices: PriceData[], windowSeconds: number): number {
-    if (prices.length === 0) return 0;
-    const endTime = prices[prices.length - 1].timestamp;
-    const startTime = endTime - windowSeconds;
-    const windowPrices = prices.filter(p => p.timestamp >= startTime);
-    if (windowPrices.length === 0) return prices[prices.length - 1].price;
-    const sum = windowPrices.reduce((acc, p) => acc + p.price, 0);
-    return sum / windowPrices.length;
-  }
-
-  static isDepeg(currentTWAP: number, referencePrice: number, threshold: number): boolean {
-    if (referencePrice === 0) return false;
-    const deviation = Math.abs(currentTWAP - referencePrice) / referencePrice;
-    return deviation > threshold;
+  static async advanceSlots(connection: Connection, slots: number): Promise<void> {
+    const currentSlot = await connection.getSlot();
+    await connection.requestAirdrop(Keypair.generate().publicKey, 0); // dummy to force slot advance in test validator
+    // In practice test-validator automatically advances; here we simulate wait
+    await new Promise((resolve) => setTimeout(resolve, slots * 50)); // rough 400ms/slot scaling
   }
 }
 
 export class LagInjector {
-  private connection: Connection;
-  private oraclePubkey: PublicKey;
   private config: LagInjectorConfig;
+  private series: HistoricalPriceSeries | null = null;
+  private currentIndex: number = 0;
 
-  constructor(connection: Connection, oraclePubkey: PublicKey, config: LagInjectorConfig) {
-    this.connection = connection;
-    this.oraclePubkey = oraclePubkey;
+  constructor(config: LagInjectorConfig) {
     this.config = config;
   }
 
-  async injectSeries(seriesIndex: number, slotOffset: number): Promise<void> {
-    const series = this.config.series[seriesIndex];
-    if (!series || series.prices.length === 0) return;
+  injectSeries(series: HistoricalPriceSeries): void {
+    this.series = series;
+    this.currentIndex = 0;
+  }
 
-    const currentSlot = await this.getCurrentSlot();
-    const baseSlot = currentSlot - slotOffset;
-
-    for (let i = 0; i < series.prices.length; i++) {
-      const priceData = series.prices[i];
-      const targetSlot = baseSlot + Math.floor((priceData.timestamp - series.prices[0].timestamp) / 0.4);
-      const lagSlot = targetSlot - this.config.lagSlots;
-
-      await this.updateOracleWithLag(priceData.price, lagSlot);
+  async updateOracleWithLag(
+    connection: Connection,
+    provider: anchor.AnchorProvider,
+    priceIndex: number
+  ): Promise<void> {
+    if (!this.series || priceIndex >= this.series.prices.length) {
+      return;
     }
+
+    const laggedIndex = Math.max(0, priceIndex - Math.floor(this.config.lagMs / 400)); // ~400ms per slot
+    const priceData = this.series.prices[laggedIndex];
+
+    const ix = OracleUtils.createUpdatePriceInstruction(
+      this.config.oraclePubkey,
+      priceData,
+      this.config.payer.publicKey
+    );
+
+    const tx = new anchor.web3.Transaction().add(ix);
+    await provider.sendAndConfirm(tx, [this.config.payer]);
+    this.currentIndex = priceIndex;
   }
 
-  private async getCurrentSlot(): Promise<number> {
-    const slot = await this.connection.getSlot();
-    return slot;
+  getCurrentLagMs(): number {
+    return this.config.lagMs;
   }
 
-  private async updateOracleWithLag(price: number, slot: number): Promise<void> {
-    // In test harness this would update a mock oracle account at the lagged slot
-    // For simulation we simply log the action; real implementation would use a custom oracle program
-    console.log(`[LagInjector] Update oracle at slot ${slot} with price ${price}`);
+  getSeriesLength(): number {
+    return this.series ? this.series.prices.length : 0;
   }
 
-  async advanceToSlot(targetSlot: number): Promise<void> {
-    // Simulate slot advancement for test validator
-    console.log(`[LagInjector] Advanced to slot ${targetSlot}`);
+  getPriceAt(index: number): PriceData | null {
+    if (!this.series || index < 0 || index >= this.series.prices.length) {
+      return null;
+    }
+    return this.series.prices[index];
   }
 }
 
-export function checkTWAPFalsePositive(
-  series: HistoricalPriceSeries,
-  windowSeconds: number,
-  depegThreshold: number,
-  referencePrice: number
-): boolean {
-  const twap = OracleUtils.calculateTWAP(series.prices, windowSeconds);
-  const isFlagged = OracleUtils.isDepeg(twap, referencePrice, depegThreshold);
-  // False positive = flagged but price never actually crossed threshold in raw series
-  if (!isFlagged) return false;
-  const maxDeviation = series.prices.reduce((max, p) => {
-    const dev = Math.abs(p.price - referencePrice) / referencePrice;
-    return Math.max(max, dev);
-  }, 0);
-  return maxDeviation <= depegThreshold;
-}
-
-export async function runSimulationTick(
-  provider: anchor.AnchorProvider,
-  program: Program,
-  injector: LagInjector,
-  checker: any,
-  tick: number,
-  series: HistoricalPriceSeries[]
-): Promise<{ breakerTripped: boolean; falsePositive: boolean }> {
-  const currentSlot = await provider.connection.getSlot();
-  const laggedSlot = currentSlot - 120; // example 45s @ ~400ms/slot
-
-  await injector.advanceToSlot(laggedSlot);
-
-  if (tick % 3 === 0 && series.length > 0) {
-    await injector.injectSeries(0, laggedSlot);
-  }
-
-  const lastSeries = series[series.length - 1] || OracleUtils.createHistoricalPriceSeries([], 0, 1);
-  const falsePositive = checkTWAPFalsePositive(lastSeries, 15, 0.05, 1.0);
-  const breakerTripped = falsePositive; // simplified for harness
-
-  return { breakerTripped, falsePositive };
-}
-
-// Re-export for backward compatibility with existing sim files
 export { OracleUtils as default };
