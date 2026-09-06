@@ -1,92 +1,114 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey } from "@solana/web3.js";
+import { Connection, PublicKey, TransactionInstruction, Keypair } from "@solana/web3.js";
+import { BN } from "bn.js";
 
 export interface PriceData {
-  price: number;
-  timestamp: number;
+  price: BN;
+  timestamp: BN;
 }
 
 export interface HistoricalPriceSeries {
-  mint: string;
   prices: PriceData[];
-}
-
-export interface TWAP {
-  value: number;
-  startSlot: number;
-  endSlot: number;
+  oracle: PublicKey;
 }
 
 export interface LagInjectorConfig {
-  lagMs: number;
-  slotDurationMs: number;
-  oracleProgramId: PublicKey;
-  oracleAccount: PublicKey;
+  lagSlots: number;
+  targetLagMs: number;
+  series: HistoricalPriceSeries[];
 }
 
 export interface OracleConfig {
+  oracle: PublicKey;
+  owner: PublicKey;
   lagSlots: number;
-  updateInterval: number;
 }
 
 export class OracleUtils {
-  static createPriceFeed(mint: string, prices: PriceData[]): HistoricalPriceSeries {
-    return { mint, prices };
-  }
-
-  static calculateTWAP(series: HistoricalPriceSeries, windowMs: number = 15000): TWAP {
-    if (series.prices.length === 0) {
-      return { value: 0, startSlot: 0, endSlot: 0 };
-    }
-
-    const sorted = [...series.prices].sort((a, b) => a.timestamp - b.timestamp);
-    const now = sorted[sorted.length - 1].timestamp;
-    const windowStart = now - windowMs;
-
-    const windowPrices = sorted.filter(p => p.timestamp >= windowStart);
-    if (windowPrices.length === 0) {
-      return { value: sorted[sorted.length - 1].price, startSlot: 0, endSlot: 0 };
-    }
-
-    const sum = windowPrices.reduce((acc, p) => acc + p.price, 0);
-    const avg = sum / windowPrices.length;
-
+  static createPriceData(price: number, timestamp: number): PriceData {
     return {
-      value: avg,
-      startSlot: Math.floor(windowStart / 400),
-      endSlot: Math.floor(now / 400)
+      price: new BN(Math.floor(price * 1_000_000)), // 6 decimals
+      timestamp: new BN(timestamp),
     };
   }
 
+  static createHistoricalPriceSeries(oracle: PublicKey, prices: PriceData[]): HistoricalPriceSeries {
+    return {
+      prices,
+      oracle,
+    };
+  }
+
+  static getHistoricalPriceSeries(config: LagInjectorConfig, oracle: PublicKey): HistoricalPriceSeries | undefined {
+    return config.series.find(s => s.oracle.equals(oracle));
+  }
+
+  static createLagInjectorConfig(
+    lagSlots: number,
+    targetLagMs: number,
+    series: HistoricalPriceSeries[]
+  ): LagInjectorConfig {
+    return {
+      lagSlots,
+      targetLagMs,
+      series,
+    };
+  }
+
+  static createUpdatePriceInstruction(
+    oracle: PublicKey,
+    priceData: PriceData,
+    signer: PublicKey
+  ): TransactionInstruction {
+    // Placeholder for Switchboard-like update; in real sim this would be a real CPI or custom ix
+    const data = Buffer.from([
+      1, // discriminator
+      ...priceData.price.toArray("le", 8),
+      ...priceData.timestamp.toArray("le", 8),
+    ]);
+    return new TransactionInstruction({
+      keys: [
+        { pubkey: oracle, isSigner: false, isWritable: true },
+        { pubkey: signer, isSigner: true, isWritable: false },
+      ],
+      programId: new PublicKey("SW1TCH7K2a3w4zXJ8v9pQ2mN7bL5kR6tY4uI9oP0qRs"), // dummy oracle program
+      data,
+    });
+  }
+
+  static async replaySeriesWithLag(
+    connection: Connection,
+    config: LagInjectorConfig,
+    currentSlot: number
+  ): Promise<void> {
+    for (const series of config.series) {
+      const lagIndex = Math.max(0, series.prices.length - config.lagSlots - 1);
+      if (lagIndex < series.prices.length) {
+        const laggedPrice = series.prices[lagIndex];
+        const ix = this.createUpdatePriceInstruction(series.oracle, laggedPrice, PublicKey.default);
+        // In full sim this would be sent; here we just log for test harness
+        console.log(`Injected lagged price ${laggedPrice.price.toString()} at slot ${currentSlot}`);
+      }
+    }
+  }
+
   static checkTWAPFalsePositive(
-    series: HistoricalPriceSeries,
-    twapThreshold: number = 0.05,
-    windowMs: number = 15000
+    prices: PriceData[],
+    windowSeconds: number,
+    thresholdBps: number
   ): boolean {
-    const twap = OracleUtils.calculateTWAP(series, windowMs);
-    if (twap.value === 0) return false;
+    if (prices.length < 2) return false;
+    const now = prices[prices.length - 1].timestamp.toNumber();
+    const windowStart = now - windowSeconds;
+    const windowPrices = prices.filter(p => p.timestamp.toNumber() >= windowStart);
+    if (windowPrices.length < 2) return false;
 
-    const latest = series.prices[series.prices.length - 1].price;
-    const deviation = Math.abs(latest - twap.value) / twap.value;
-    return deviation > twapThreshold;
-  }
-
-  static simulateLag(
-    series: HistoricalPriceSeries,
-    lagMs: number
-  ): HistoricalPriceSeries {
-    const laggedPrices = series.prices.map(p => ({
-      price: p.price,
-      timestamp: p.timestamp + lagMs
-    }));
-    return { mint: series.mint, prices: laggedPrices };
+    const startPrice = windowPrices[0].price.toNumber();
+    const endPrice = windowPrices[windowPrices.length - 1].price.toNumber();
+    const changeBps = Math.abs((endPrice - startPrice) * 10000 / startPrice);
+    return changeBps < thresholdBps;
   }
 }
 
-export function checkTWAPFalsePositive(
-  series: HistoricalPriceSeries,
-  twapThreshold: number = 0.05,
-  windowMs: number = 15000
-): boolean {
-  return OracleUtils.checkTWAPFalsePositive(series, twapThreshold, windowMs);
-}
+export { OracleUtils };
+export type { PriceData, HistoricalPriceSeries, LagInjectorConfig, OracleConfig };
