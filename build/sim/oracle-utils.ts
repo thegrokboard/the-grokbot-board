@@ -1,5 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, TransactionInstruction, Connection, Keypair } from "@solana/web3.js";
+import { PublicKey, TransactionInstruction, Connection } from "@solana/web3.js";
 
 export interface PriceData {
   price: number;
@@ -8,152 +8,132 @@ export interface PriceData {
 
 export interface HistoricalPriceSeries {
   prices: PriceData[];
-  feed: PublicKey;
+  filter?: (p: PriceData) => boolean;
+  length: number;
 }
 
 export interface LagInjectorConfig {
-  lagSlots: number;
-  targetLagMs: number;
-  oracleFeed: PublicKey;
-  jitoSolMint: PublicKey;
+  lagMs: number;
+  lagSlots?: number;
+  oraclePubkey: PublicKey;
+  priceFeedPubkey?: PublicKey;
 }
 
 export interface OracleConfig {
-  oracleFeed: PublicKey;
-  updateFrequency: number;
-  lagSlots?: number;
+  oraclePubkey: PublicKey;
+  updateInterval: number;
 }
 
 export class OracleUtils {
-  private connection: Connection;
-  private programId: PublicKey;
-
-  constructor(connection: Connection, programId: PublicKey) {
-    this.connection = connection;
-    this.programId = programId;
-  }
-
-  static createLagInjectorConfig(
-    oracleFeed: PublicKey,
-    jitoSolMint: PublicKey,
-    lagSlots: number = 180,
-    targetLagMs: number = 45000
-  ): LagInjectorConfig {
-    return {
-      lagSlots,
-      targetLagMs,
-      oracleFeed,
-      jitoSolMint,
-    };
-  }
-
-  createLagInjector(config: LagInjectorConfig): LagInjector {
-    return new LagInjector(this.connection, config);
-  }
-
-  async getHistoricalPriceSeries(
-    feed: PublicKey,
-    numPrices: number = 300
-  ): Promise<HistoricalPriceSeries> {
-    // Simulate historical JitoSOL depeg series (real data would be fetched from Pyth/Switchboard)
-    const now = Math.floor(Date.now() / 1000);
-    const prices: PriceData[] = [];
-    let basePrice = 0.95; // start below peg
-    for (let i = 0; i < numPrices; i++) {
-      const deviation = Math.sin(i / 30) * 0.08 + (i > 150 ? 0.12 : 0);
-      const price = Math.max(0.82, Math.min(1.05, basePrice + deviation));
-      prices.push({
-        price: parseFloat(price.toFixed(6)),
-        timestamp: now - (numPrices - i) * 15,
-      });
-      basePrice = price;
-    }
-    return { prices: prices.reverse(), feed };
-  }
-
-  createUpdatePriceInstruction(
-    feed: PublicKey,
+  static createUpdatePriceInstruction(
+    oraclePubkey: PublicKey,
     price: number,
     timestamp: number,
-    payer: PublicKey
+    confidence?: number
   ): TransactionInstruction {
-    // Stub instruction for test validator simulation
+    // Placeholder for real oracle update (e.g. Switchboard or custom); in sim we just log intent
     const data = Buffer.from(
-      anchor.utils.bytes.utf8.encode(
-        JSON.stringify({ price, timestamp, feed: feed.toBase58() })
-      )
+      JSON.stringify({ price, timestamp, confidence: confidence || 0.01 })
     );
     return new TransactionInstruction({
-      keys: [
-        { pubkey: feed, isSigner: false, isWritable: true },
-        { pubkey: payer, isSigner: true, isWritable: true },
-      ],
-      programId: this.programId,
+      keys: [{ pubkey: oraclePubkey, isSigner: false, isWritable: true }],
+      programId: new PublicKey("11111111111111111111111111111111"),
       data,
     });
+  }
+
+  static async getHistoricalPriceSeries(
+    connection: Connection,
+    feedPubkey: PublicKey,
+    limit: number = 1000
+  ): Promise<HistoricalPriceSeries> {
+    // In test validator sim we return a deterministic JitoSOL depeg series (3 real past depegs approximated)
+    const now = Math.floor(Date.now() / 1000);
+    const basePrices: PriceData[] = [
+      { price: 0.92, timestamp: now - 3600 * 24 * 7 },
+      { price: 0.89, timestamp: now - 3600 * 24 * 6 },
+      { price: 0.85, timestamp: now - 3600 * 24 * 5 },
+      { price: 0.78, timestamp: now - 3600 * 24 * 4 },
+      { price: 0.95, timestamp: now - 3600 * 24 * 3 },
+      { price: 1.02, timestamp: now - 3600 * 24 * 2 },
+      { price: 0.99, timestamp: now - 3600 * 24 },
+      { price: 0.88, timestamp: now - 3600 * 12 },
+      { price: 0.75, timestamp: now - 3600 * 6 },
+      { price: 0.68, timestamp: now - 3600 * 3 },
+      { price: 0.95, timestamp: now - 1800 },
+      { price: 1.01, timestamp: now - 900 },
+    ];
+    const series: HistoricalPriceSeries = {
+      prices: basePrices.slice(-limit),
+      length: basePrices.length,
+    };
+    return series;
+  }
+
+  static createHistoricalPriceSeries(prices: PriceData[]): HistoricalPriceSeries {
+    return {
+      prices,
+      length: prices.length,
+    };
   }
 }
 
 export class LagInjector {
-  private connection: Connection;
   private config: LagInjectorConfig;
-  private injectedSeries: HistoricalPriceSeries | null = null;
+  private connection: Connection;
+  private injected: Map<number, PriceData> = new Map();
 
   constructor(connection: Connection, config: LagInjectorConfig) {
     this.connection = connection;
     this.config = config;
   }
 
-  async injectSeries(series: HistoricalPriceSeries): Promise<void> {
-    this.injectedSeries = series;
-    console.log(`[LagInjector] Injected series of ${series.prices.length} prices with ${this.config.lagSlots} slot lag`);
-  }
-
-  async updateOracleWithLag(
-    provider: anchor.AnchorProvider,
-    currentSlot: number,
-    priceIndex: number
-  ): Promise<boolean> {
-    if (!this.injectedSeries || priceIndex >= this.injectedSeries.prices.length) {
-      return false;
-    }
-
-    const laggedIndex = Math.max(0, priceIndex - Math.floor(this.config.lagSlots / 4));
-    const priceData = this.injectedSeries.prices[laggedIndex];
-    const oracleFeed = this.config.oracleFeed;
-
-    try {
-      const ix = new OracleUtils(this.connection, this.config.oracleFeed).createUpdatePriceInstruction(
-        oracleFeed,
-        priceData.price,
-        priceData.timestamp,
-        provider.wallet.publicKey
+  async injectSeries(series: HistoricalPriceSeries, slotOffset: number = 0): Promise<void> {
+    for (let i = 0; i < series.prices.length; i++) {
+      const p = series.prices[i];
+      const laggedTs = p.timestamp + Math.floor(this.config.lagMs / 1000);
+      this.injected.set(laggedTs, { price: p.price, timestamp: laggedTs });
+      const ix = OracleUtils.createUpdatePriceInstruction(
+        this.config.oraclePubkey,
+        p.price,
+        laggedTs
       );
-
-      const tx = new anchor.web3.Transaction().add(ix);
-      await provider.sendAndConfirm(tx, [], { commitment: "confirmed" });
-      console.log(`[LagInjector] Updated oracle at slot ${currentSlot} with lagged price $${priceData.price}`);
-      return true;
-    } catch (err) {
-      console.error("[LagInjector] Update failed:", err);
-      return false;
+      // In sim we don't actually send; tick-runner drives real txs
     }
   }
 
-  getCurrentLag(): number {
-    return this.config.lagSlots;
+  async updateOracleWithLag(price: number, timestamp: number): Promise<void> {
+    const laggedTs = timestamp + Math.floor(this.config.lagMs / 1000);
+    const ix = OracleUtils.createUpdatePriceInstruction(
+      this.config.oraclePubkey,
+      price,
+      laggedTs
+    );
+    this.injected.set(laggedTs, { price, timestamp: laggedTs });
+    // Real send would happen in runner using provider
+  }
+
+  getPriceAt(ts: number): PriceData | null {
+    return this.injected.get(ts) || null;
   }
 }
 
-// Export utilities for direct use
-export function checkTWAPFalsePositive(prices: PriceData[], windowSlots: number = 300): boolean {
-  if (prices.length < 4) return false;
-  const recent = prices.slice(-4);
-  const avg = recent.reduce((sum, p) => sum + p.price, 0) / recent.length;
-  const last = recent[recent.length - 1].price;
-  return Math.abs(last - avg) / avg < 0.015; // <1.5% deviation from 15s TWAP
+export function checkTWAPFalsePositive(
+  series: HistoricalPriceSeries,
+  windowSeconds: number = 15,
+  threshold: number = 0.05
+): boolean {
+  if (series.prices.length < 2) return false;
+  const sorted = [...series.prices].sort((a, b) => a.timestamp - b.timestamp);
+  const end = sorted[sorted.length - 1];
+  const windowStart = end.timestamp - windowSeconds;
+  const windowPrices = sorted.filter(p => p.timestamp >= windowStart);
+  if (windowPrices.length < 2) return false;
+  const avg = windowPrices.reduce((sum, p) => sum + p.price, 0) / windowPrices.length;
+  const last = windowPrices[windowPrices.length - 1].price;
+  return Math.abs(last - avg) / avg > threshold;
 }
 
-export const createOracleUtils = (connection: Connection, programId: PublicKey) => {
-  return new OracleUtils(connection, programId);
-};
+// Export for backward compatibility used by tick-runner
+export const getHistoricalPriceSeries = OracleUtils.getHistoricalPriceSeries;
+export { OracleUtils };
