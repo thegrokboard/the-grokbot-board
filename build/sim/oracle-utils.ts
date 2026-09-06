@@ -1,88 +1,138 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection, TransactionInstruction, Keypair } from "@solana/web3.js";
+import { PublicKey, Connection, Keypair } from "@solana/web3.js";
+import { OracleConfig } from "../programs/vault/target/types/vault"; // Align with program IDL if needed, but minimal for sim
 
 export interface PriceData {
-  price: number;
-  timestamp: number;
+  price: number; // in USD, scaled or raw as per series
+  timestamp: number; // unix ms
 }
 
-export type HistoricalPriceSeries = PriceData[];
+export interface HistoricalPriceSeries {
+  prices: PriceData[];
+  asset: string;
+  startSlot: number;
+  endSlot: number;
+}
 
 export interface LagInjectorConfig {
-  lagSlots: number;
+  lagMs: number; // target 45000
+  slotLag: number;
   oraclePubkey: PublicKey;
-  payer: Keypair;
+  priceFeedPubkey?: PublicKey;
+  jitoSolMint: PublicKey;
 }
 
-export interface OracleConfig {
-  oraclePubkey: PublicKey;
-  lagSlots: number;
+export interface OracleUtils {
+  getHistoricalPriceSeries: (asset: string, startSlot: number, endSlot: number) => Promise<HistoricalPriceSeries>;
+  createLagInjectorConfig: (oraclePubkey: PublicKey, lagMs?: number) => LagInjectorConfig;
 }
 
-export class OracleUtils {
-  static createUpdatePriceInstruction(
-    oraclePubkey: PublicKey,
-    priceData: PriceData,
-    payer: Keypair
-  ): TransactionInstruction {
-    // Minimal placeholder for simulation; in real harness this would build a pyth/switchboard update IX
-    const data = Buffer.from(
-      JSON.stringify({
-        price: priceData.price,
-        timestamp: priceData.timestamp,
-      })
-    );
-    return new TransactionInstruction({
-      keys: [
-        { pubkey: oraclePubkey, isSigner: false, isWritable: true },
-        { pubkey: payer.publicKey, isSigner: true, isWritable: false },
-      ],
-      programId: new PublicKey("11111111111111111111111111111111"),
-      data,
-    });
-  }
-
-  static async getHistoricalPriceSeries(
-    connection: Connection,
-    oraclePubkey: PublicKey,
-    limit: number = 1000
+export const OracleUtils: OracleUtils = {
+  async getHistoricalPriceSeries(
+    asset: string,
+    startSlot: number,
+    endSlot: number
   ): Promise<HistoricalPriceSeries> {
-    // For pure-onchain sim we replay fixed Jito depeg series; real implementation would query on-chain history
-    // Hard-coded replay of three known JitoSOL depeg price series (price in USD, timestamps in seconds)
-    const baseTime = Math.floor(Date.now() / 1000) - 3600;
-    const series: HistoricalPriceSeries = [
-      // Series 1: stable ~0.98-1.00
-      { price: 0.995, timestamp: baseTime - 180 },
-      { price: 0.998, timestamp: baseTime - 150 },
-      { price: 1.002, timestamp: baseTime - 120 },
-      // Series 2: sudden depeg to 0.85
-      { price: 0.97, timestamp: baseTime - 90 },
-      { price: 0.92, timestamp: baseTime - 60 },
-      { price: 0.85, timestamp: baseTime - 30 },
-      // Series 3: recovery + volatility
-      { price: 0.88, timestamp: baseTime },
-      { price: 0.94, timestamp: baseTime + 30 },
-      { price: 0.99, timestamp: baseTime + 60 },
-      { price: 1.01, timestamp: baseTime + 90 },
-    ];
-    return series.slice(-limit);
+    // Minimal stub returning last 3 Jito depeg series (hardcoded for sim replay)
+    // In full version would fetch from onchain history or fixture
+    const now = Date.now();
+    return {
+      asset,
+      startSlot,
+      endSlot,
+      prices: [
+        { price: 0.92, timestamp: now - 180000 },
+        { price: 0.85, timestamp: now - 120000 },
+        { price: 0.78, timestamp: now - 60000 },
+        { price: 0.95, timestamp: now - 30000 },
+        { price: 0.99, timestamp: now },
+      ],
+    };
+  },
+
+  createLagInjectorConfig(oraclePubkey: PublicKey, lagMs: number = 45000): LagInjectorConfig {
+    return {
+      lagMs,
+      slotLag: Math.floor(lagMs / 400), // ~400ms per slot
+      oraclePubkey,
+      jitoSolMint: new PublicKey("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"), // JitoSOL mint
+    };
+  },
+};
+
+export class LagInjector {
+  private config: LagInjectorConfig;
+  private connection: Connection;
+  private provider: anchor.AnchorProvider;
+  private lastInjected: Map<string, PriceData> = new Map();
+
+  constructor(provider: anchor.AnchorProvider, config: LagInjectorConfig) {
+    this.provider = provider;
+    this.connection = provider.connection;
+    this.config = config;
   }
 
-  static calculateTWAP(series: HistoricalPriceSeries, windowSeconds: number): number {
-    if (series.length === 0) return 0;
-    const now = series[series.length - 1].timestamp;
-    const windowStart = now - windowSeconds;
-    const windowData = series.filter((p) => p.timestamp >= windowStart);
-    if (windowData.length === 0) return series[series.length - 1].price;
-    const sum = windowData.reduce((acc, p) => acc + p.price, 0);
-    return sum / windowData.length;
+  async injectSeries(series: HistoricalPriceSeries): Promise<void> {
+    for (const price of series.prices) {
+      await this.updateOracleWithLag(price);
+    }
+  }
+
+  async updateOracleWithLag(priceData: PriceData): Promise<void> {
+    const laggedTime = priceData.timestamp + this.config.lagMs;
+    const now = Date.now();
+    if (laggedTime > now) {
+      const waitMs = laggedTime - now;
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+
+    // Simulate oracle update (in real sim: call Switchboard or Pyth update ix)
+    // For pure-onchain test-validator, we just log and store for TWAP
+    this.lastInjected.set(this.config.oraclePubkey.toString(), {
+      price: priceData.price,
+      timestamp: laggedTime,
+    });
+
+    console.log(`[LagInjector] Updated oracle with lagged price: ${priceData.price} at slot ~${Math.floor(laggedTime / 400)}`);
+  }
+
+  getLatestPrice(): PriceData | null {
+    const key = this.config.oraclePubkey.toString();
+    return this.lastInjected.get(key) || null;
   }
 }
 
-export namespace OracleUtils {
-  export type PriceData = PriceData;
-  export type HistoricalPriceSeries = HistoricalPriceSeries;
+export function createLagInjector(
+  provider: anchor.AnchorProvider,
+  config: LagInjectorConfig
+): LagInjector {
+  return new LagInjector(provider, config);
 }
 
-// Export the class as the primary interface (avoids redeclaration while matching prior usage patterns)
-export { OracleUtils };
+export async function checkTWAPFalsePositive(
+  series: HistoricalPriceSeries,
+  twapWindowMs: number = 15000
+): Promise<boolean> {
+  if (series.prices.length < 2) return false;
+
+  const now = Date.now();
+  const windowStart = now - twapWindowMs;
+
+  const recent = series.prices.filter((p) => p.timestamp >= windowStart);
+  if (recent.length < 2) return false;
+
+  const sum = recent.reduce((acc, p) => acc + p.price, 0);
+  const twap = sum / recent.length;
+
+  // JitoSOL depeg false-positive threshold (e.g. >5% drawdown triggers breaker)
+  const depegThreshold = 0.92; // 8% drawdown
+  const isFalsePositive = twap > depegThreshold && recent[recent.length - 1].price < depegThreshold * 0.95;
+
+  console.log(`[TWAPChecker] TWAP=${twap.toFixed(4)}, latest=${recent[recent.length - 1].price.toFixed(4)}, falsePositive=${isFalsePositive}`);
+  return isFalsePositive;
+}
+
+// Re-export for compatibility with committed files
+export { checkTWAPFalsePositive as checkTWAPFalsePositive };
+export { HistoricalPriceSeries, PriceData, LagInjectorConfig };
+export { getHistoricalPriceSeries } from "./oracle-utils"; // self-consistent
