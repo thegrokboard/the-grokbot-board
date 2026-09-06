@@ -1,100 +1,88 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, Connection, TransactionInstruction, Keypair } from "@solana/web3.js";
 
 export interface PriceData {
   price: number;
   timestamp: number;
 }
 
-export interface HistoricalPriceSeries {
-  prices: PriceData[];
-}
+export type HistoricalPriceSeries = PriceData[];
 
 export interface LagInjectorConfig {
-  lagMs: number;
+  lagSlots: number;
   oraclePubkey: PublicKey;
+  payer: Keypair;
 }
 
 export interface OracleConfig {
-  lagSlots: number;
   oraclePubkey: PublicKey;
-}
-
-export interface TWAPCheckResult {
-  tripped: boolean;
-  currentTWAP: number;
-  depegThreshold: number;
-  reason: string;
+  lagSlots: number;
 }
 
 export class OracleUtils {
-  static createPriceData(price: number, timestamp: number): PriceData {
-    return { price, timestamp };
-  }
-
-  static createHistoricalPriceSeries(prices: PriceData[]): HistoricalPriceSeries {
-    return { prices };
-  }
-
-  static createLagInjectorConfig(lagMs: number, oraclePubkey: PublicKey): LagInjectorConfig {
-    return { lagMs, oraclePubkey };
-  }
-
-  static createOracleConfig(lagSlots: number, oraclePubkey: PublicKey): OracleConfig {
-    return { lagSlots, oraclePubkey };
-  }
-
-  static checkTWAPFalsePositive(
-    series: HistoricalPriceSeries,
-    windowMs: number,
-    depegThreshold: number
-  ): TWAPCheckResult {
-    if (series.prices.length < 2) {
-      return {
-        tripped: false,
-        currentTWAP: 0,
-        depegThreshold,
-        reason: "insufficient data",
-      };
-    }
-
-    const sorted = [...series.prices].sort((a, b) => a.timestamp - b.timestamp);
-    const now = sorted[sorted.length - 1].timestamp;
-    const windowStart = now - windowMs;
-
-    const windowPrices = sorted.filter((p) => p.timestamp >= windowStart);
-    if (windowPrices.length === 0) {
-      return {
-        tripped: false,
-        currentTWAP: 0,
-        depegThreshold,
-        reason: "no prices in window",
-      };
-    }
-
-    const sum = windowPrices.reduce((acc, p) => acc + p.price, 0);
-    const twap = sum / windowPrices.length;
-
-    const tripped = twap < depegThreshold;
-
-    return {
-      tripped,
-      currentTWAP: twap,
-      depegThreshold,
-      reason: tripped ? "TWAP below threshold" : "within bounds",
-    };
+  static createUpdatePriceInstruction(
+    oraclePubkey: PublicKey,
+    priceData: PriceData,
+    payer: Keypair
+  ): TransactionInstruction {
+    // Minimal placeholder for simulation; in real harness this would build a pyth/switchboard update IX
+    const data = Buffer.from(
+      JSON.stringify({
+        price: priceData.price,
+        timestamp: priceData.timestamp,
+      })
+    );
+    return new TransactionInstruction({
+      keys: [
+        { pubkey: oraclePubkey, isSigner: false, isWritable: true },
+        { pubkey: payer.publicKey, isSigner: true, isWritable: false },
+      ],
+      programId: new PublicKey("11111111111111111111111111111111"),
+      data,
+    });
   }
 
   static async getHistoricalPriceSeries(
-    connection: anchor.web3.Connection,
-    oracle: PublicKey,
-    limit: number = 100
+    connection: Connection,
+    oraclePubkey: PublicKey,
+    limit: number = 1000
   ): Promise<HistoricalPriceSeries> {
-    // In sim we replay static data; real implementation would read from account history.
-    // For test-validator sim we return empty and let lag-injector populate.
-    return { prices: [] };
+    // For pure-onchain sim we replay fixed Jito depeg series; real implementation would query on-chain history
+    // Hard-coded replay of three known JitoSOL depeg price series (price in USD, timestamps in seconds)
+    const baseTime = Math.floor(Date.now() / 1000) - 3600;
+    const series: HistoricalPriceSeries = [
+      // Series 1: stable ~0.98-1.00
+      { price: 0.995, timestamp: baseTime - 180 },
+      { price: 0.998, timestamp: baseTime - 150 },
+      { price: 1.002, timestamp: baseTime - 120 },
+      // Series 2: sudden depeg to 0.85
+      { price: 0.97, timestamp: baseTime - 90 },
+      { price: 0.92, timestamp: baseTime - 60 },
+      { price: 0.85, timestamp: baseTime - 30 },
+      // Series 3: recovery + volatility
+      { price: 0.88, timestamp: baseTime },
+      { price: 0.94, timestamp: baseTime + 30 },
+      { price: 0.99, timestamp: baseTime + 60 },
+      { price: 1.01, timestamp: baseTime + 90 },
+    ];
+    return series.slice(-limit);
+  }
+
+  static calculateTWAP(series: HistoricalPriceSeries, windowSeconds: number): number {
+    if (series.length === 0) return 0;
+    const now = series[series.length - 1].timestamp;
+    const windowStart = now - windowSeconds;
+    const windowData = series.filter((p) => p.timestamp >= windowStart);
+    if (windowData.length === 0) return series[series.length - 1].price;
+    const sum = windowData.reduce((acc, p) => acc + p.price, 0);
+    return sum / windowData.length;
   }
 }
 
-export const checkTWAPFalsePositive = OracleUtils.checkTWAPFalsePositive;
+export namespace OracleUtils {
+  export type PriceData = PriceData;
+  export type HistoricalPriceSeries = HistoricalPriceSeries;
+}
+
+// Export the class as the primary interface (avoids redeclaration while matching prior usage patterns)
 export { OracleUtils };
