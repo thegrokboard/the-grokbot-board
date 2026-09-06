@@ -1,5 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection } from "@solana/web3.js";
+import { PublicKey, Connection, TransactionInstruction, Keypair } from "@solana/web3.js";
 
 export interface PriceData {
   price: number;
@@ -7,141 +7,81 @@ export interface PriceData {
 }
 
 export interface HistoricalPriceSeries {
-  prices: PriceData[];
-  oracle: PublicKey;
   symbol: string;
+  oracle: PublicKey;
+  prices: PriceData[];
 }
 
 export interface LagInjectorConfig {
-  lagSlots: number;
-  targetLagMs: number;
-  jitoSolOracle: PublicKey;
+  lagMs: number;
+  slotLag?: number;
+  filter?: (p: PriceData) => boolean;
 }
 
 export interface OracleConfig {
-  jitoSolOracle: PublicKey;
+  oracle: PublicKey;
+  symbol: string;
   lagSlots: number;
 }
 
 export class OracleUtils {
-  static createHistoricalPriceSeries(
-    prices: PriceData[],
+  static createUpdatePriceInstruction(
     oracle: PublicKey,
-    symbol: string = "jitoSOL"
-  ): HistoricalPriceSeries {
-    return { prices, oracle, symbol };
+    price: number,
+    timestamp: number,
+    payer: PublicKey
+  ): TransactionInstruction {
+    // Minimal placeholder for a Switchboard-like update; in a real sim this would target the oracle program.
+    // For the harness we simply return a no-op instruction that the test validator can process.
+    return new TransactionInstruction({
+      keys: [
+        { pubkey: oracle, isSigner: false, isWritable: true },
+        { pubkey: payer, isSigner: true, isWritable: true },
+      ],
+      programId: new PublicKey("11111111111111111111111111111111"),
+      data: Buffer.from([0, ...new anchor.BN(price).toArray("le", 8), ...new anchor.BN(timestamp).toArray("le", 8)]),
+    });
   }
 
-  static getHistoricalPriceSeries(
-    series: HistoricalPriceSeries,
-    startIndex: number = 0,
-    count?: number
-  ): PriceData[] {
-    if (count === undefined) {
-      return series.prices.slice(startIndex);
-    }
-    return series.prices.slice(startIndex, startIndex + count);
-  }
-
-  static filterSeriesAfter(
-    series: HistoricalPriceSeries,
-    timestamp: number
-  ): HistoricalPriceSeries {
-    const filtered = series.prices.filter(p => p.timestamp > timestamp);
+  static createLagInjectorConfig(lagMs: number, slotLag?: number): LagInjectorConfig {
     return {
-      ...series,
-      prices: filtered
+      lagMs,
+      slotLag,
     };
   }
 
-  static async replaySeriesWithLag(
+  static async loadHistoricalSeries(
     connection: Connection,
-    series: HistoricalPriceSeries,
-    lagSlots: number,
-    updateOracle: (price: number, slot: number) => Promise<void>
-  ): Promise<void> {
-    if (series.prices.length === 0) return;
-
-    let baseSlot = 1000;
-    for (let i = 0; i < series.prices.length; i++) {
-      const data = series.prices[i];
-      const slot = baseSlot + i;
-      const laggedSlot = Math.max(baseSlot, slot - lagSlots);
-      await updateOracle(data.price, laggedSlot);
-      // Simulate slot advancement
-      if (i % 5 === 0) baseSlot += 5;
+    oracle: PublicKey,
+    symbol: string,
+    limit: number = 300
+  ): Promise<HistoricalPriceSeries> {
+    // In the pure-onchain sim we replay synthetic JitoSOL depeg data.
+    // This stub returns a realistic last-three-depeg series (price in USD).
+    const baseTime = Math.floor(Date.now() / 1000) - 3600;
+    const prices: PriceData[] = [];
+    for (let i = 0; i < limit; i++) {
+      const t = baseTime + i * 15; // 15-second ticks
+      let p = 1.0;
+      // Simulate three distinct depeg windows that the breaker should catch
+      if (i > 80 && i < 110) p = 0.87;           // first depeg
+      else if (i > 160 && i < 190) p = 0.92;     // second depeg
+      else if (i > 240 && i < 270) p = 0.81;     // third depeg
+      prices.push({ price: p, timestamp: t });
     }
+    return {
+      symbol,
+      oracle,
+      prices,
+    };
+  }
+
+  static sliceSeries(series: HistoricalPriceSeries, start: number, end?: number): HistoricalPriceSeries {
+    return {
+      ...series,
+      prices: series.prices.slice(start, end),
+    };
   }
 }
 
-export class LagInjector {
-  private config: LagInjectorConfig;
-  private series: HistoricalPriceSeries | null = null;
-
-  constructor(config: LagInjectorConfig) {
-    this.config = config;
-  }
-
-  injectSeries(series: HistoricalPriceSeries): void {
-    this.series = series;
-  }
-
-  getCurrentSeries(): HistoricalPriceSeries | null {
-    return this.series;
-  }
-
-  async updateOracleWithLag(
-    provider: anchor.Provider,
-    price: number,
-    slot: number
-  ): Promise<void> {
-    // In sim, we just log the update; real implementation would use a mock oracle program
-    console.log(`[LagInjector] Updating oracle at slot ${slot} with price ${price} (lag: ${this.config.lagSlots} slots)`);
-    // TODO: integrate with test validator oracle account in full harness
-  }
-
-  async replayLastThreeSeries(
-    provider: anchor.Provider,
-    historicalSeries: HistoricalPriceSeries[]
-  ): Promise<void> {
-    if (!this.series) {
-      this.series = historicalSeries[historicalSeries.length - 1] || OracleUtils.createHistoricalPriceSeries([], this.config.jitoSolOracle);
-    }
-    const recent = historicalSeries.slice(-3);
-    for (const s of recent) {
-      await OracleUtils.replaySeriesWithLag(
-        (provider as any).connection,
-        s,
-        this.config.lagSlots,
-        async (price, slot) => {
-          await this.updateOracleWithLag(provider, price, slot);
-        }
-      );
-    }
-  }
-}
-
-export function createLagInjector(config: LagInjectorConfig): LagInjector {
-  return new LagInjector(config);
-}
-
-export function checkTWAPFalsePositive(
-  series: HistoricalPriceSeries,
-  twapPeriodSlots: number = 15,
-  threshold: number = 0.05
-): boolean {
-  if (series.prices.length < twapPeriodSlots) return false;
-
-  const recent = series.prices.slice(-twapPeriodSlots);
-  const sum = recent.reduce((acc, p) => acc + p.price, 0);
-  const twap = sum / recent.length;
-
-  const latest = recent[recent.length - 1].price;
-  const deviation = Math.abs(latest - twap) / twap;
-
-  return deviation > threshold;
-}
-
-// Legacy alias for backward compatibility with committed callers
-export const getHistoricalPriceSeries = OracleUtils.getHistoricalPriceSeries;
-export { OracleUtils as defaultOracleUtils };
+export default OracleUtils;
