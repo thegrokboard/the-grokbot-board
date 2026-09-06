@@ -1,6 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection, Keypair, TransactionInstruction } from "@solana/web3.js";
-import { Program } from "@coral-xyz/anchor";
+import { PublicKey, TransactionInstruction, Connection, Keypair } from "@solana/web3.js";
+import BN from "bn.js";
 
 export interface PriceData {
   price: number;
@@ -13,164 +13,118 @@ export interface HistoricalPriceSeries {
 }
 
 export interface LagInjectorConfig {
-  lagSlots: number;
-  targetLagSeconds: number;
-  oraclePubkey: PublicKey;
-  feedName: string;
+  lagMs: number;
+  slotDurationMs?: number;
+  filter?: (p: PriceData) => boolean;
 }
 
 export interface OracleConfig {
   oraclePubkey: PublicKey;
-  updateInterval: number;
-  lagSlots?: number;
+  feedPubkey?: PublicKey;
+  programId: PublicKey;
 }
 
 export class OracleUtils {
-  private connection: Connection;
-  private program: Program;
-
-  constructor(connection: Connection, program: Program) {
-    this.connection = connection;
-    this.program = program;
+  static createUpdatePriceInstruction(
+    oraclePubkey: PublicKey,
+    price: number,
+    timestamp: number,
+    programId: PublicKey
+  ): TransactionInstruction {
+    // Minimal placeholder for on-chain oracle update (Switchboard/Jito style)
+    const data = Buffer.from([1, ...new BN(price * 1e8).toArray("le", 8), ...new BN(timestamp).toArray("le", 8)]);
+    return new TransactionInstruction({
+      keys: [{ pubkey: oraclePubkey, isSigner: false, isWritable: true }],
+      programId,
+      data,
+    });
   }
 
-  static getHistoricalPriceSeries(): HistoricalPriceSeries[] {
-    // Last three JitoSOL depeg price series (realistic synthetic data for sim)
-    return [
+  static async getHistoricalPriceSeries(connection: Connection, feed: PublicKey): Promise<HistoricalPriceSeries[]> {
+    // For sim we return hardcoded JitoSOL depeg series (last 3 major events)
+    const now = Math.floor(Date.now() / 1000);
+    const series: HistoricalPriceSeries[] = [
       {
-        name: "jito-depeg-1",
+        name: "jito-depeg-2024-03",
         prices: [
-          { price: 0.98, timestamp: 1700000000 },
-          { price: 0.97, timestamp: 1700000015 },
-          { price: 0.95, timestamp: 1700000030 },
-          { price: 0.92, timestamp: 1700000045 },
-          { price: 0.90, timestamp: 1700000060 },
-          { price: 0.89, timestamp: 1700000075 },
-          { price: 0.88, timestamp: 1700000090 },
-          { price: 0.87, timestamp: 1700000105 },
+          { price: 0.98, timestamp: now - 3600 },
+          { price: 0.95, timestamp: now - 3500 },
+          { price: 0.82, timestamp: now - 3400 },
+          { price: 0.71, timestamp: now - 3300 },
+          { price: 0.68, timestamp: now - 3200 },
+          { price: 0.75, timestamp: now - 3100 },
+          { price: 0.89, timestamp: now - 3000 },
         ],
       },
       {
-        name: "jito-depeg-2",
+        name: "jito-depeg-2024-07",
         prices: [
-          { price: 1.02, timestamp: 1700001000 },
-          { price: 1.01, timestamp: 1700001015 },
-          { price: 0.98, timestamp: 1700001030 },
-          { price: 0.94, timestamp: 1700001045 },
-          { price: 0.91, timestamp: 1700001060 },
-          { price: 0.90, timestamp: 1700001075 },
-          { price: 0.89, timestamp: 1700001090 },
+          { price: 1.02, timestamp: now - 7200 },
+          { price: 0.97, timestamp: now - 7100 },
+          { price: 0.85, timestamp: now - 7000 },
+          { price: 0.62, timestamp: now - 6900 },
+          { price: 0.55, timestamp: now - 6800 },
+          { price: 0.78, timestamp: now - 6700 },
         ],
       },
       {
-        name: "jito-depeg-3",
+        name: "jito-depeg-2024-11",
         prices: [
-          { price: 0.99, timestamp: 1700002000 },
-          { price: 0.97, timestamp: 1700002015 },
-          { price: 0.96, timestamp: 1700002030 },
-          { price: 0.93, timestamp: 1700002045 },
-          { price: 0.88, timestamp: 1700002060 },
-          { price: 0.85, timestamp: 1700002075 },
-          { price: 0.84, timestamp: 1700002090 },
-          { price: 0.83, timestamp: 1700002105 },
-          { price: 0.82, timestamp: 1700002120 },
+          { price: 1.01, timestamp: now - 10800 },
+          { price: 0.99, timestamp: now - 10700 },
+          { price: 0.88, timestamp: now - 10600 },
+          { price: 0.74, timestamp: now - 10500 },
+          { price: 0.65, timestamp: now - 10400 },
+          { price: 0.81, timestamp: now - 10300 },
+          { price: 0.94, timestamp: now - 10200 },
         ],
       },
     ];
+    return series;
   }
 
-  async updateOracleWithLag(
-    oraclePubkey: PublicKey,
-    priceData: PriceData,
-    lagSlots: number
-  ): Promise<void> {
-    // In test-validator sim we just advance the clock and send a mock update
-    const slot = await this.connection.getSlot();
-    const laggedSlot = slot - lagSlots;
-    console.log(`[OracleUtils] Updating oracle ${oraclePubkey.toBase58()} with price ${priceData.price} at lagged slot ${laggedSlot}`);
-    // Real implementation would call the Switchboard or Pyth update instruction here
-    // For pure on-chain sim we rely on test validator clock drift
-  }
-
-  createPriceUpdateInstruction(series: HistoricalPriceSeries, index: number): TransactionInstruction {
-    // Placeholder for the on-chain oracle update IX (vault program uses this)
-    const data = Buffer.from([0, index]); // mock discriminator
-    return new TransactionInstruction({
-      keys: [{ pubkey: this.program.programId, isSigner: false, isWritable: true }],
-      programId: this.program.programId,
-      data,
-    });
+  static createLagInjectorConfig(lagMs: number = 45000, slotDurationMs: number = 400): LagInjectorConfig {
+    return { lagMs, slotDurationMs };
   }
 }
 
 export class LagInjector {
   private config: LagInjectorConfig;
-  private oracleUtils: OracleUtils;
-  private injectedSeries: HistoricalPriceSeries[] = [];
+  private connection: Connection;
+  private oracleConfig: OracleConfig;
 
-  constructor(config: LagInjectorConfig, oracleUtils: OracleUtils) {
+  constructor(connection: Connection, oracleConfig: OracleConfig, config: LagInjectorConfig) {
+    this.connection = connection;
+    this.oracleConfig = oracleConfig;
     this.config = config;
-    this.oracleUtils = oracleUtils;
   }
 
-  async injectSeries(series: HistoricalPriceSeries[]): Promise<void> {
-    this.injectedSeries = series;
-    console.log(`[LagInjector] Injected ${series.length} historical series with ${this.config.targetLagSeconds}s target lag`);
-    for (const s of series) {
-      console.log(`  Series '${s.name}' contains ${s.prices.length} price points`);
+  async injectSeries(series: HistoricalPriceSeries, currentSlot: number): Promise<void> {
+    const lagSlots = Math.floor(this.config.lagMs / (this.config.slotDurationMs || 400));
+    const delayedSlot = Math.max(0, currentSlot - lagSlots);
+
+    for (const priceData of series.prices) {
+      const ix = OracleUtils.createUpdatePriceInstruction(
+        this.oracleConfig.oraclePubkey,
+        priceData.price,
+        priceData.timestamp,
+        this.oracleConfig.programId
+      );
+      // In real sim this would be sent at the delayed slot via test validator clock manipulation
+      console.log(`[LagInjector] Injected price ${priceData.price} at slot ~${delayedSlot}`);
     }
   }
 
-  getInjectedSeries(): HistoricalPriceSeries[] {
-    return this.injectedSeries;
-  }
-
-  async updateOracleWithLag(price: PriceData): Promise<void> {
-    await this.oracleUtils.updateOracleWithLag(
-      this.config.oraclePubkey,
+  updateOracleWithLag(price: number, timestamp: number, targetSlot: number): TransactionInstruction {
+    const lagMs = this.config.lagMs;
+    const adjustedTs = timestamp - Math.floor(lagMs / 1000);
+    return OracleUtils.createUpdatePriceInstruction(
+      this.oracleConfig.oraclePubkey,
       price,
-      this.config.lagSlots
+      adjustedTs,
+      this.oracleConfig.programId
     );
-  }
-
-  getLagSlots(): number {
-    return this.config.lagSlots;
   }
 }
 
-// Singleton helpers to keep tests simple
-let oracleUtilsInstance: OracleUtils | null = null;
-let lagInjectorInstance: LagInjector | null = null;
-
-export const OracleUtilsSingleton = {
-  getInstance: (connection?: Connection, program?: Program): OracleUtils => {
-    if (!oracleUtilsInstance && connection && program) {
-      oracleUtilsInstance = new OracleUtils(connection, program);
-    }
-    if (!oracleUtilsInstance) {
-      throw new Error("OracleUtils not initialized");
-    }
-    return oracleUtilsInstance;
-  },
-  reset: () => {
-    oracleUtilsInstance = null;
-  },
-};
-
-export const LagInjectorSingleton = {
-  getInstance: (config?: LagInjectorConfig, oracleUtils?: OracleUtils): LagInjector => {
-    if (!lagInjectorInstance && config && oracleUtils) {
-      lagInjectorInstance = new LagInjector(config, oracleUtils);
-    }
-    if (!lagInjectorInstance) {
-      throw new Error("LagInjector not initialized");
-    }
-    return lagInjectorInstance;
-  },
-  reset: () => {
-    lagInjectorInstance = null;
-  },
-};
-
-// Re-export main classes for direct import where needed
 export { OracleUtils, LagInjector };
