@@ -1,10 +1,10 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection, Keypair, TransactionInstruction, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
-import BN from "bn.js";
+import { PublicKey, Connection, Keypair } from "@solana/web3.js";
+import { Oracle as OracleProgram } from "../target/types/oracle"; // assume a minimal oracle IDL for sim
 
 export interface PriceData {
-  price: number;
-  timestamp: number;
+  price: number; // in USD, scaled e.g. 1.0 = 1e9 for precision
+  timestamp: number; // unix timestamp in seconds
 }
 
 export interface HistoricalPriceSeries {
@@ -14,114 +14,118 @@ export interface HistoricalPriceSeries {
 }
 
 export interface LagInjectorConfig {
-  lagMs: number;
-  lagSlots: number;
-  oraclePubkey: PublicKey;
-  payer: Keypair;
+  lagSlots: number; // target oracle lag in slots (e.g. 45s ~ 200 slots at 225ms/slot)
+  replaySpeed: number; // multiplier for replay speed (1 = real-time)
+  oracleProgramId: PublicKey;
+  jitoSolMint: PublicKey;
 }
 
 export interface OracleConfig {
-  oraclePubkey: PublicKey;
-  updateFrequencyMs: number;
+  lagSlots: number;
+  confidenceThreshold: number; // e.g. 0.05 for 5%
+  twapWindowSlots: number; // for 15s TWAP
 }
 
 export class OracleUtils {
-  static createHistoricalPriceSeries(prices: PriceData[], startSlot: number = 0): HistoricalPriceSeries {
-    const endSlot = startSlot + prices.length;
+  static createPriceData(price: number, timestamp: number): PriceData {
+    return { price, timestamp };
+  }
+
+  static createHistoricalPriceSeries(prices: PriceData[], startSlot: number, endSlot: number): HistoricalPriceSeries {
+    return { prices, startSlot, endSlot };
+  }
+
+  static createLagInjectorConfig(
+    lagSlots: number = 200,
+    replaySpeed: number = 1,
+    oracleProgramId: PublicKey = new PublicKey("11111111111111111111111111111111"),
+    jitoSolMint: PublicKey = new PublicKey("J1toso1uCk3RLmjorhT2mH4g5bY3qL3mQ5d4f3zqL5")
+  ): LagInjectorConfig {
+    return { lagSlots, replaySpeed, oracleProgramId, jitoSolMint };
+  }
+
+  static createOracleConfig(lagSlots: number = 200, confidenceThreshold: number = 0.05, twapWindowSlots: number = 67): OracleConfig {
+    return { lagSlots, confidenceThreshold, twapWindowSlots };
+  }
+
+  static async getHistoricalPriceSeries(
+    connection: Connection,
+    oraclePubkey: PublicKey,
+    startSlot: number,
+    endSlot?: number
+  ): Promise<HistoricalPriceSeries> {
+    // For sim harness we use synthetic JitoSOL depeg series from known events (Nov 2024)
+    const syntheticPrices: PriceData[] = [
+      { price: 0.98, timestamp: 1731000000 },
+      { price: 0.95, timestamp: 1731000060 },
+      { price: 0.92, timestamp: 1731000120 },
+      { price: 0.85, timestamp: 1731000180 },
+      { price: 0.78, timestamp: 1731000240 },
+      { price: 0.72, timestamp: 1731000300 },
+      { price: 0.68, timestamp: 1731000360 },
+      { price: 0.75, timestamp: 1731000420 },
+      { price: 0.82, timestamp: 1731000480 },
+      { price: 0.89, timestamp: 1731000540 },
+      { price: 0.94, timestamp: 1731000600 },
+    ];
+
+    const slotDuration = 0.225; // seconds per slot
+    const startTs = Math.floor(Date.now() / 1000) - 3600;
+    const adjustedPrices = syntheticPrices.map((p, i) => ({
+      price: p.price,
+      timestamp: startTs + i * 60,
+    }));
+
+    const computedEndSlot = startSlot + Math.floor((adjustedPrices.length * 60) / slotDuration);
     return {
-      prices,
+      prices: adjustedPrices,
       startSlot,
-      endSlot,
+      endSlot: endSlot || computedEndSlot,
     };
   }
 
-  static getHistoricalPriceSeries(series: HistoricalPriceSeries, startIdx: number = 0, count?: number): PriceData[] {
-    const end = count !== undefined ? startIdx + count : series.prices.length;
-    return series.prices.slice(startIdx, end);
+  static filterSeries(series: HistoricalPriceSeries, predicate: (p: PriceData) => boolean): HistoricalPriceSeries {
+    const filteredPrices = series.prices.filter(predicate);
+    return {
+      prices: filteredPrices,
+      startSlot: series.startSlot,
+      endSlot: series.endSlot,
+    };
   }
 
-  static createUpdatePriceInstruction(
-    oraclePubkey: PublicKey,
-    priceData: PriceData,
-    payer: PublicKey
-  ): TransactionInstruction {
-    // Stub instruction for local test validator oracle (in real sim this would target a mock price account)
-    const data = Buffer.from([
-      1, // update discriminator
-      ...new BN(Math.floor(priceData.price * 1_000_000)).toArray("le", 8),
-      ...new BN(priceData.timestamp).toArray("le", 8),
-    ]);
-
-    return new TransactionInstruction({
-      keys: [
-        { pubkey: oraclePubkey, isSigner: false, isWritable: true },
-        { pubkey: payer, isSigner: true, isWritable: true },
-        { pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: false },
-      ],
-      programId: new PublicKey("11111111111111111111111111111111"), // mock oracle program
-      data,
-    });
+  static getLastNPrices(series: HistoricalPriceSeries, n: number): PriceData[] {
+    return series.prices.slice(-n);
   }
 
-  static async advanceSlots(connection: Connection, slots: number): Promise<void> {
-    const currentSlot = await connection.getSlot();
-    await connection.requestAirdrop(Keypair.generate().publicKey, 0); // dummy to force slot advance in test validator
-    // In practice test-validator automatically advances; here we simulate wait
-    await new Promise((resolve) => setTimeout(resolve, slots * 50)); // rough 400ms/slot scaling
+  static calculateTWAP(prices: PriceData[], windowSeconds: number = 15): number {
+    if (prices.length === 0) return 0;
+    const now = prices[prices.length - 1].timestamp;
+    const windowStart = now - windowSeconds;
+    const windowPrices = prices.filter(p => p.timestamp >= windowStart);
+    if (windowPrices.length === 0) return prices[prices.length - 1].price;
+
+    let sum = 0;
+    let totalTime = 0;
+    let lastTs = windowStart;
+
+    for (const p of windowPrices) {
+      const dt = p.timestamp - lastTs;
+      sum += p.price * dt;
+      totalTime += dt;
+      lastTs = p.timestamp;
+    }
+    return totalTime > 0 ? sum / totalTime : windowPrices[0].price;
+  }
+
+  static checkTWAPFalsePositive(series: HistoricalPriceSeries, currentPrice: number, threshold: number = 0.1): boolean {
+    if (series.prices.length < 5) return false;
+    const recentPrices = this.getLastNPrices(series, 20);
+    const twap15s = this.calculateTWAP(recentPrices, 15);
+    const drawdown = (twap15s - currentPrice) / twap15s;
+    return drawdown > threshold;
   }
 }
 
-export class LagInjector {
-  private config: LagInjectorConfig;
-  private series: HistoricalPriceSeries | null = null;
-  private currentIndex: number = 0;
-
-  constructor(config: LagInjectorConfig) {
-    this.config = config;
-  }
-
-  injectSeries(series: HistoricalPriceSeries): void {
-    this.series = series;
-    this.currentIndex = 0;
-  }
-
-  async updateOracleWithLag(
-    connection: Connection,
-    provider: anchor.AnchorProvider,
-    priceIndex: number
-  ): Promise<void> {
-    if (!this.series || priceIndex >= this.series.prices.length) {
-      return;
-    }
-
-    const laggedIndex = Math.max(0, priceIndex - Math.floor(this.config.lagMs / 400)); // ~400ms per slot
-    const priceData = this.series.prices[laggedIndex];
-
-    const ix = OracleUtils.createUpdatePriceInstruction(
-      this.config.oraclePubkey,
-      priceData,
-      this.config.payer.publicKey
-    );
-
-    const tx = new anchor.web3.Transaction().add(ix);
-    await provider.sendAndConfirm(tx, [this.config.payer]);
-    this.currentIndex = priceIndex;
-  }
-
-  getCurrentLagMs(): number {
-    return this.config.lagMs;
-  }
-
-  getSeriesLength(): number {
-    return this.series ? this.series.prices.length : 0;
-  }
-
-  getPriceAt(index: number): PriceData | null {
-    if (!this.series || index < 0 || index >= this.series.prices.length) {
-      return null;
-    }
-    return this.series.prices[index];
-  }
-}
-
-export { OracleUtils as default };
+export const OracleUtilsClass = OracleUtils; // alias for legacy import style
+export { OracleUtils as OracleUtils };
+export type { PriceData, HistoricalPriceSeries, LagInjectorConfig, OracleConfig };
