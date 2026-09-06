@@ -1,5 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey, TransactionInstruction, Keypair } from "@solana/web3.js";
+import { PublicKey, Connection, Keypair } from "@solana/web3.js";
 import { PythSolanaReceiver } from "@pythnetwork/pyth-solana-receiver";
 
 export interface PriceData {
@@ -8,71 +8,97 @@ export interface PriceData {
 }
 
 export interface HistoricalPriceSeries {
-  symbol: string;
   prices: PriceData[];
 }
 
 export interface LagInjectorConfig {
-  lagSlots: number;
-  oracleProgramId: PublicKey;
-  priceFeedId: PublicKey;
+  lagMs: number;
+  oraclePubkey: PublicKey;
+  priceAccount: PublicKey;
 }
 
 export interface OracleConfig {
+  oraclePubkey: PublicKey;
+  priceAccount: PublicKey;
   lagSlots: number;
-  priceFeed: string;
 }
 
 export class OracleUtils {
-  static async getHistoricalPriceSeries(
+  static createLagInjectorConfig(
+    lagMs: number,
+    oraclePubkey: PublicKey,
+    priceAccount: PublicKey
+  ): LagInjectorConfig {
+    return { lagMs, oraclePubkey, priceAccount };
+  }
+
+  static createOracleConfig(
+    oraclePubkey: PublicKey,
+    priceAccount: PublicKey,
+    lagSlots: number
+  ): OracleConfig {
+    return { oraclePubkey, priceAccount, lagSlots };
+  }
+
+  static async fetchHistoricalSeries(
     connection: Connection,
-    feedId: PublicKey,
-    numPrices: number = 100
+    priceAccount: PublicKey,
+    count: number = 100
   ): Promise<HistoricalPriceSeries> {
-    // For sim we replay known JitoSOL depeg series; in real would pull from Pyth history
-    const basePrice = 0.95;
-    const series: PriceData[] = [];
+    // Mock historical data for simulation (in real use would pull from on-chain history or external feed)
     const now = Math.floor(Date.now() / 1000);
-    for (let i = numPrices - 1; i >= 0; i--) {
-      const deviation = i < 20 ? (20 - i) * 0.012 : 0; // simulate depeg
-      series.push({
-        price: basePrice + deviation,
+    const prices: PriceData[] = [];
+    for (let i = count - 1; i >= 0; i--) {
+      const price = 0.95 + Math.sin(i / 10) * 0.08; // simulate JitoSOL depeg around 0.9x
+      prices.push({
+        price: Math.max(price, 0.75),
         timestamp: now - i * 15,
       });
     }
-    return {
-      symbol: "jitoSOL",
-      prices: series.reverse(),
-    };
+    return { prices: prices.reverse() };
   }
 
-  static createUpdatePriceInstruction(
-    oracleConfig: OracleConfig,
-    priceData: PriceData,
-    payer: PublicKey
-  ): TransactionInstruction {
-    // Stub for sim - in real this would build a Pyth update ix with lagged data
-    return new TransactionInstruction({
-      keys: [{ pubkey: payer, isSigner: true, isWritable: true }],
-      programId: new PublicKey("Pyth111111111111111111111111111111111111111"),
-      data: Buffer.from([1, 2, 3]), // placeholder
-    });
+  static getPriceAtLag(
+    series: HistoricalPriceSeries,
+    lagMs: number,
+    currentSlot: number
+  ): PriceData | null {
+    if (!series.prices.length) return null;
+    const targetTime = Date.now() - lagMs;
+    let closest = series.prices[0];
+    let minDiff = Math.abs(closest.timestamp * 1000 - targetTime);
+    for (const p of series.prices) {
+      const diff = Math.abs(p.timestamp * 1000 - targetTime);
+      if (diff < minDiff) {
+        minDiff = diff;
+        closest = p;
+      }
+    }
+    return closest;
+  }
+
+  static calculateTWAP(
+    series: HistoricalPriceSeries,
+    windowSeconds: number = 15
+  ): number {
+    if (!series.prices.length) return 0;
+    const now = Date.now() / 1000;
+    const cutoff = now - windowSeconds;
+    const recent = series.prices.filter((p) => p.timestamp >= cutoff);
+    if (!recent.length) return series.prices[series.prices.length - 1].price;
+    const sum = recent.reduce((acc, p) => acc + p.price, 0);
+    return sum / recent.length;
   }
 
   static checkTWAPFalsePositive(
     series: HistoricalPriceSeries,
-    twapPeriodSlots: number = 15
+    threshold: number = 0.85,
+    windowSeconds: number = 15
   ): boolean {
-    if (series.prices.length < twapPeriodSlots) return false;
-    const recent = series.prices.slice(-twapPeriodSlots);
-    const sum = recent.reduce((acc, p) => acc + p.price, 0);
-    const twap = sum / recent.length;
-    const lastPrice = recent[recent.length - 1].price;
-    // False-positive if TWAP stays above 0.90 while spot dipped hard (sim depeg threshold)
-    return twap > 0.90 && lastPrice < 0.85;
+    const twap = OracleUtils.calculateTWAP(series, windowSeconds);
+    return twap > threshold;
   }
 }
 
-export const getHistoricalPriceSeries = OracleUtils.getHistoricalPriceSeries;
 export { OracleUtils };
-export const checkTWAPFalsePositive = OracleUtils.checkTWAPFalsePositive;
+export type { PriceData, HistoricalPriceSeries, LagInjectorConfig, OracleConfig };
