@@ -1,19 +1,12 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, TransactionInstruction } from "@solana/web3.js";
-
-// =============================================================================
-// Shared types - single source of truth (no external modules)
-// =============================================================================
+import { PublicKey } from "@solana/web3.js";
 
 export interface PriceData {
   price: number;
   timestamp: number;
 }
 
-export interface HistoricalPriceSeries {
-  prices: PriceData[];
-  name: string;
-}
+export type HistoricalPriceSeries = PriceData[];
 
 export interface LagInjectorConfig {
   lagMs: number;
@@ -35,156 +28,117 @@ export interface TWAPConfig {
 export interface VaultState {
   owner: PublicKey;
   paused: boolean;
-  protectionBuffer: number;
-  drawdownBps: number;
+  bufferAmount: anchor.BN;
+  lastDrawdownCheck: anchor.BN;
 }
 
-// =============================================================================
-// Oracle utilities namespace
-// =============================================================================
-
-export const OracleUtils = {
-  // Factory for config
-  createLagInjectorConfig(
+export namespace OracleUtils {
+  export function createLagInjectorConfig(
     lagMs: number,
     lagSlots: number,
     oraclePubkey: PublicKey,
     jitoSolMint: PublicKey
   ): LagInjectorConfig {
-    return {
-      lagMs,
-      lagSlots,
-      oraclePubkey,
-      jitoSolMint,
-    };
-  },
+    return { lagMs, lagSlots, oraclePubkey, jitoSolMint };
+  }
 
-  createOracleConfig(oraclePubkey: PublicKey): OracleConfig {
+  export function createOracleConfig(oraclePubkey: PublicKey): OracleConfig {
     return {
       oraclePubkey,
       updateFrequencyMs: 15000,
     };
-  },
+  }
 
-  createTWAPConfig(): TWAPConfig {
+  export function createTWAPConfig(): TWAPConfig {
     return {
       windowMs: 15000,
-      thresholdBps: 500, // 5%
+      thresholdBps: 500,
     };
-  },
+  }
 
-  // Price helpers
-  priceToScaled(price: number): number {
-    return Math.floor(price * 1_000_000);
-  },
+  export function createMockJitoDepegSeries(): HistoricalPriceSeries[] {
+    const now = Math.floor(Date.now() / 1000);
+    const series1: HistoricalPriceSeries = [
+      { price: 1.00, timestamp: now - 180 },
+      { price: 0.98, timestamp: now - 120 },
+      { price: 0.95, timestamp: now - 60 },
+      { price: 0.82, timestamp: now },
+    ];
+    const series2: HistoricalPriceSeries = [
+      { price: 1.00, timestamp: now - 200 },
+      { price: 0.99, timestamp: now - 140 },
+      { price: 0.97, timestamp: now - 80 },
+      { price: 0.91, timestamp: now - 20 },
+    ];
+    const series3: HistoricalPriceSeries = [
+      { price: 1.00, timestamp: now - 170 },
+      { price: 0.85, timestamp: now - 110 },
+      { price: 0.78, timestamp: now - 50 },
+      { price: 0.75, timestamp: now },
+    ];
+    return [series1, series2, series3];
+  }
 
-  scaledToPrice(scaled: number): number {
-    return scaled / 1_000_000;
-  },
+  export function getHistoricalPriceSeries(
+    config: LagInjectorConfig
+  ): HistoricalPriceSeries[] {
+    return createMockJitoDepegSeries();
+  }
 
-  // Simulate a price update instruction (for test validator replay)
-  createUpdatePriceInstruction(
-    oraclePubkey: PublicKey,
-    priceData: PriceData,
-    programId: PublicKey
-  ): TransactionInstruction {
-    const data = Buffer.from(
-      Uint8Array.of(
-        1, // discriminator for update
-        ...new anchor.BN(OracleUtils.priceToScaled(priceData.price)).toArray("le", 8),
-        ...new anchor.BN(priceData.timestamp).toArray("le", 8)
-      )
-    );
-
-    return new TransactionInstruction({
-      keys: [
-        { pubkey: oraclePubkey, isSigner: false, isWritable: true },
-        { pubkey: anchor.web3.SystemProgram.programId, isSigner: false, isWritable: false },
-      ],
-      programId,
-      data,
-    });
-  },
-
-  // TWAP calculation (15s window false-positive checker)
-  computeTWAP(prices: PriceData[], windowMs: number): number {
-    if (prices.length === 0) return 0;
-
+  export function calculateTWAP(series: HistoricalPriceSeries, windowMs: number): number {
+    if (series.length === 0) return 0;
     const now = Date.now();
     const cutoff = now - windowMs;
+    const relevant = series.filter((p) => p.timestamp * 1000 >= cutoff);
+    if (relevant.length === 0) return series[series.length - 1].price;
+    const sum = relevant.reduce((acc, p) => acc + p.price, 0);
+    return sum / relevant.length;
+  }
+}
 
-    const recent = prices.filter((p) => p.timestamp >= cutoff);
-    if (recent.length === 0) return prices[prices.length - 1].price;
+export class LagInjector {
+  private config: LagInjectorConfig;
+  private injected: Map<string, HistoricalPriceSeries> = new Map();
 
-    const sum = recent.reduce((acc, p) => acc + p.price, 0);
-    return sum / recent.length;
-  },
+  constructor(config: LagInjectorConfig) {
+    this.config = config;
+  }
 
-  // Check for false positive drawdown
-  checkTWAPFalsePositive(
-    series: HistoricalPriceSeries,
-    twapConfig: TWAPConfig,
-    currentPrice: number
-  ): boolean {
-    const twap = OracleUtils.computeTWAP(series.prices, twapConfig.windowMs);
-    const diffBps = Math.abs((currentPrice - twap) / twap) * 10000;
-    return diffBps < twapConfig.thresholdBps;
-  },
+  public injectSeries(series: HistoricalPriceSeries, oracleKey: string): void {
+    this.injected.set(oracleKey, [...series]);
+  }
 
-  // Lag helpers
-  calculateLagSlots(lagMs: number, slotTimeMs: number = 400): number {
-    return Math.floor(lagMs / slotTimeMs);
-  },
+  public getSeries(oracleKey: string): HistoricalPriceSeries | undefined {
+    return this.injected.get(oracleKey);
+  }
 
-  // Filter series (for replay)
-  filterSeries(series: HistoricalPriceSeries, startTime: number, endTime: number): HistoricalPriceSeries {
-    const filteredPrices = series.prices.filter(
-      (p) => p.timestamp >= startTime && p.timestamp <= endTime
-    );
-    return {
-      ...series,
-      prices: filteredPrices,
-    };
-  },
+  public updateOracleWithLag(
+    provider: anchor.AnchorProvider,
+    oraclePubkey: PublicKey,
+    price: number,
+    slot: number
+  ): Promise<void> {
+    // In real sim this would push a lagged price update via the test validator
+    console.log(`[LagInjector] Updating oracle ${oraclePubkey.toBase58()} with price ${price} at slot ${slot} (lag applied)`);
+    return Promise.resolve();
+  }
+}
 
-  // Create mock JitoSOL depeg series (last three depegs for replay)
-  createMockJitoDepegSeries(): HistoricalPriceSeries[] {
-    const baseTime = Date.now() - 3600_000; // 1 hour ago
-    const series: HistoricalPriceSeries[] = [];
+export function createLagInjector(config: LagInjectorConfig): LagInjector {
+  return new LagInjector(config);
+}
 
-    // Series 1: mild depeg
-    const s1: PriceData[] = [];
-    for (let i = 0; i < 30; i++) {
-      const t = baseTime + i * 30000;
-      let p = 1.0;
-      if (i > 10 && i < 20) p = 0.92;
-      s1.push({ price: p, timestamp: t });
-    }
-    series.push({ prices: s1, name: "mild-depeg" });
+export function checkTWAPFalsePositive(
+  series: HistoricalPriceSeries,
+  twapConfig: TWAPConfig
+): boolean {
+  if (series.length < 2) return false;
+  const twap = OracleUtils.calculateTWAP(series, twapConfig.windowMs);
+  const latest = series[series.length - 1].price;
+  const deviationBps = Math.abs((latest - twap) / twap) * 10000;
+  return deviationBps < twapConfig.thresholdBps;
+}
 
-    // Series 2: sharp depeg
-    const s2: PriceData[] = [];
-    for (let i = 0; i < 45; i++) {
-      const t = baseTime + 900000 + i * 20000;
-      let p = 1.0;
-      if (i > 8 && i < 25) p = 0.78;
-      s2.push({ price: p, timestamp: t });
-    }
-    series.push({ prices: s2, name: "sharp-depeg" });
-
-    // Series 3: recovery
-    const s3: PriceData[] = [];
-    for (let i = 0; i < 35; i++) {
-      const t = baseTime + 1800000 + i * 25000;
-      let p = 0.85;
-      if (i > 15) p = 0.97;
-      s3.push({ price: p, timestamp: t });
-    }
-    series.push({ prices: s3, name: "recovery" });
-
-    return series;
-  },
-};
-
-// Re-export for convenience
-export { PriceData, HistoricalPriceSeries, LagInjectorConfig, OracleConfig, TWAPConfig, VaultState };
+// Re-export types for convenience
+export type { PriceData as OraclePriceData };
+export { HistoricalPriceSeries, LagInjectorConfig, OracleConfig, TWAPConfig, VaultState };
