@@ -1,6 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Connection, Keypair } from "@solana/web3.js";
-import { PythSolanaReceiver } from "@pythnetwork/pyth-solana-receiver";
+import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 
 export interface PriceData {
   price: number;
@@ -9,96 +8,97 @@ export interface PriceData {
 
 export interface HistoricalPriceSeries {
   prices: PriceData[];
+  mint: string;
 }
 
 export interface LagInjectorConfig {
-  lagMs: number;
-  oraclePubkey: PublicKey;
-  priceAccount: PublicKey;
+  lagSlots: number;
+  oracleProgramId: PublicKey;
+  oracleAccount: PublicKey;
+  targetLagMs: number;
 }
 
 export interface OracleConfig {
-  oraclePubkey: PublicKey;
-  priceAccount: PublicKey;
-  lagSlots: number;
+  oracleAccount: PublicKey;
+  oracleProgramId: PublicKey;
+  updateFrequency: number;
 }
 
 export class OracleUtils {
-  static createLagInjectorConfig(
-    lagMs: number,
-    oraclePubkey: PublicKey,
-    priceAccount: PublicKey
-  ): LagInjectorConfig {
-    return { lagMs, oraclePubkey, priceAccount };
-  }
-
-  static createOracleConfig(
-    oraclePubkey: PublicKey,
-    priceAccount: PublicKey,
-    lagSlots: number
-  ): OracleConfig {
-    return { oraclePubkey, priceAccount, lagSlots };
+  static createUpdatePriceInstruction(
+    oracleProgramId: PublicKey,
+    oracleAccount: PublicKey,
+    priceData: PriceData
+  ): TransactionInstruction {
+    // Placeholder for Pyth/Switchboard update instruction; in test harness this is a no-op that logs the update
+    return new TransactionInstruction({
+      keys: [{ pubkey: oracleAccount, isSigner: false, isWritable: true }],
+      programId: oracleProgramId,
+      data: Buffer.from(JSON.stringify(priceData)),
+    });
   }
 
   static async fetchHistoricalSeries(
     connection: Connection,
-    priceAccount: PublicKey,
-    count: number = 100
+    mint: string,
+    limit: number = 1000
   ): Promise<HistoricalPriceSeries> {
-    // Mock historical data for simulation (in real use would pull from on-chain history or external feed)
-    const now = Math.floor(Date.now() / 1000);
-    const prices: PriceData[] = [];
-    for (let i = count - 1; i >= 0; i--) {
-      const price = 0.95 + Math.sin(i / 10) * 0.08; // simulate JitoSOL depeg around 0.9x
-      prices.push({
-        price: Math.max(price, 0.75),
-        timestamp: now - i * 15,
-      });
-    }
-    return { prices: prices.reverse() };
+    // For the sim harness we return deterministic JitoSOL depeg series
+    // Three example depeg events (price in USD)
+    const basePrices: PriceData[] = [
+      { price: 1.00, timestamp: Date.now() - 3600000 },
+      { price: 0.98, timestamp: Date.now() - 2700000 },
+      { price: 0.95, timestamp: Date.now() - 1800000 },
+      { price: 0.92, timestamp: Date.now() - 900000 },
+      { price: 0.89, timestamp: Date.now() - 600000 },
+      { price: 0.87, timestamp: Date.now() - 300000 },
+      { price: 0.85, timestamp: Date.now() - 120000 },
+      { price: 0.84, timestamp: Date.now() - 60000 },
+      { price: 0.83, timestamp: Date.now() - 30000 },
+      { price: 1.00, timestamp: Date.now() },
+    ];
+
+    // Duplicate and shift for three distinct series
+    const series1 = basePrices.map((p, i) => ({
+      price: p.price * (1 - i * 0.005),
+      timestamp: p.timestamp + i * 15000,
+    }));
+
+    const series2 = basePrices.map((p, i) => ({
+      price: Math.max(0.75, p.price - 0.12 + Math.sin(i) * 0.03),
+      timestamp: p.timestamp + 45000 + i * 15000,
+    }));
+
+    const series3 = basePrices.map((p, i) => ({
+      price: p.price * 0.91 + (i % 3 === 0 ? -0.04 : 0.02),
+      timestamp: p.timestamp + 90000 + i * 15000,
+    }));
+
+    const allPrices = [...series1, ...series2, ...series3]
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .slice(0, limit);
+
+    return {
+      prices: allPrices,
+      mint,
+    };
   }
 
-  static getPriceAtLag(
-    series: HistoricalPriceSeries,
-    lagMs: number,
-    currentSlot: number
-  ): PriceData | null {
-    if (!series.prices.length) return null;
-    const targetTime = Date.now() - lagMs;
-    let closest = series.prices[0];
-    let minDiff = Math.abs(closest.timestamp * 1000 - targetTime);
-    for (const p of series.prices) {
-      const diff = Math.abs(p.timestamp * 1000 - targetTime);
-      if (diff < minDiff) {
-        minDiff = diff;
-        closest = p;
-      }
-    }
-    return closest;
+  static getHistoricalPriceSeries(series: HistoricalPriceSeries, startIndex: number, count: number): PriceData[] {
+    if (!series || !series.prices) return [];
+    const end = Math.min(startIndex + count, series.prices.length);
+    return series.prices.slice(startIndex, end);
   }
 
-  static calculateTWAP(
-    series: HistoricalPriceSeries,
-    windowSeconds: number = 15
-  ): number {
-    if (!series.prices.length) return 0;
-    const now = Date.now() / 1000;
-    const cutoff = now - windowSeconds;
-    const recent = series.prices.filter((p) => p.timestamp >= cutoff);
-    if (!recent.length) return series.prices[series.prices.length - 1].price;
-    const sum = recent.reduce((acc, p) => acc + p.price, 0);
-    return sum / recent.length;
-  }
-
-  static checkTWAPFalsePositive(
-    series: HistoricalPriceSeries,
-    threshold: number = 0.85,
-    windowSeconds: number = 15
-  ): boolean {
-    const twap = OracleUtils.calculateTWAP(series, windowSeconds);
-    return twap > threshold;
+  static calculateTWAP(prices: PriceData[], windowSeconds: number = 15): number {
+    if (prices.length === 0) return 0;
+    const now = prices[prices.length - 1].timestamp;
+    const cutoff = now - windowSeconds * 1000;
+    const windowPrices = prices.filter(p => p.timestamp >= cutoff);
+    if (windowPrices.length === 0) return prices[prices.length - 1].price;
+    const sum = windowPrices.reduce((acc, p) => acc + p.price, 0);
+    return sum / windowPrices.length;
   }
 }
 
-export { OracleUtils };
-export type { PriceData, HistoricalPriceSeries, LagInjectorConfig, OracleConfig };
+export default OracleUtils;
