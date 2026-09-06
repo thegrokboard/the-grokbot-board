@@ -1,3 +1,6 @@
+import * as anchor from "@coral-xyz/anchor";
+import { PublicKey, TransactionInstruction, Connection, Keypair } from "@solana/web3.js";
+
 export interface PriceData {
   price: number;
   timestamp: number;
@@ -5,109 +8,152 @@ export interface PriceData {
 
 export interface HistoricalPriceSeries {
   prices: PriceData[];
-  filter: (predicate: (p: PriceData) => boolean) => HistoricalPriceSeries;
-  length: number;
-  slice: (start?: number, end?: number) => HistoricalPriceSeries;
+  feed: PublicKey;
 }
 
 export interface LagInjectorConfig {
-  lagMs: number;
-  slotExact: boolean;
+  lagSlots: number;
+  targetLagMs: number;
+  oracleFeed: PublicKey;
+  jitoSolMint: PublicKey;
 }
 
 export interface OracleConfig {
-  updateFrequencyMs: number;
-  maxHistory: number;
+  oracleFeed: PublicKey;
+  updateFrequency: number;
+  lagSlots?: number;
 }
 
-export interface OracleUtils {
-  createPriceData(price: number, timestamp: number): PriceData;
-  createHistoricalSeries(prices: PriceData[]): HistoricalPriceSeries;
-  createLagInjector(config: LagInjectorConfig): LagInjector;
-  createOracleConfig(updateFrequencyMs?: number, maxHistory?: number): OracleConfig;
-}
+export class OracleUtils {
+  private connection: Connection;
+  private programId: PublicKey;
 
-export interface LagInjector {
-  injectSeries(series: HistoricalPriceSeries, provider: any, oraclePubkey: any): Promise<void>;
-  updateOracleWithLag(price: PriceData, provider: any, oraclePubkey: any, lagMs: number): Promise<void>;
-}
+  constructor(connection: Connection, programId: PublicKey) {
+    this.connection = connection;
+    this.programId = programId;
+  }
 
-export const OracleUtils: OracleUtils = {
-  createPriceData(price: number, timestamp: number): PriceData {
-    return { price, timestamp };
-  },
-
-  createHistoricalSeries(prices: PriceData[]): HistoricalPriceSeries {
-    const series: HistoricalPriceSeries = {
-      prices,
-      filter: (predicate: (p: PriceData) => boolean) => {
-        const filtered = prices.filter(predicate);
-        return OracleUtils.createHistoricalSeries(filtered);
-      },
-      get length() {
-        return prices.length;
-      },
-      slice(start?: number, end?: number): HistoricalPriceSeries {
-        const sliced = prices.slice(start, end);
-        return OracleUtils.createHistoricalSeries(sliced);
-      },
+  static createLagInjectorConfig(
+    oracleFeed: PublicKey,
+    jitoSolMint: PublicKey,
+    lagSlots: number = 180,
+    targetLagMs: number = 45000
+  ): LagInjectorConfig {
+    return {
+      lagSlots,
+      targetLagMs,
+      oracleFeed,
+      jitoSolMint,
     };
-    return series;
-  },
+  }
 
   createLagInjector(config: LagInjectorConfig): LagInjector {
-    return {
-      async injectSeries(series: HistoricalPriceSeries, provider: any, oraclePubkey: any): Promise<void> {
-        // Simulates lagged oracle updates for the full series
-        for (let i = 0; i < series.prices.length; i++) {
-          const p = series.prices[i];
-          await this.updateOracleWithLag(p, provider, oraclePubkey, config.lagMs);
-        }
-      },
-      async updateOracleWithLag(
-        price: PriceData,
-        provider: any,
-        oraclePubkey: any,
-        lagMs: number
-      ): Promise<void> {
-        // In a real sim this would advance the test validator clock and call the oracle update ix
-        // For type compatibility and compilation we stub the side effects
-        console.log(`[LagInjector] Updating oracle with lagged price ${price.price} (lagMs=${lagMs}) at ts=${price.timestamp}`);
-      },
-    };
-  },
+    return new LagInjector(this.connection, config);
+  }
 
-  createOracleConfig(updateFrequencyMs = 15000, maxHistory = 10000): OracleConfig {
-    return { updateFrequencyMs, maxHistory };
-  },
+  async getHistoricalPriceSeries(
+    feed: PublicKey,
+    numPrices: number = 300
+  ): Promise<HistoricalPriceSeries> {
+    // Simulate historical JitoSOL depeg series (real data would be fetched from Pyth/Switchboard)
+    const now = Math.floor(Date.now() / 1000);
+    const prices: PriceData[] = [];
+    let basePrice = 0.95; // start below peg
+    for (let i = 0; i < numPrices; i++) {
+      const deviation = Math.sin(i / 30) * 0.08 + (i > 150 ? 0.12 : 0);
+      const price = Math.max(0.82, Math.min(1.05, basePrice + deviation));
+      prices.push({
+        price: parseFloat(price.toFixed(6)),
+        timestamp: now - (numPrices - i) * 15,
+      });
+      basePrice = price;
+    }
+    return { prices: prices.reverse(), feed };
+  }
+
+  createUpdatePriceInstruction(
+    feed: PublicKey,
+    price: number,
+    timestamp: number,
+    payer: PublicKey
+  ): TransactionInstruction {
+    // Stub instruction for test validator simulation
+    const data = Buffer.from(
+      anchor.utils.bytes.utf8.encode(
+        JSON.stringify({ price, timestamp, feed: feed.toBase58() })
+      )
+    );
+    return new TransactionInstruction({
+      keys: [
+        { pubkey: feed, isSigner: false, isWritable: true },
+        { pubkey: payer, isSigner: true, isWritable: true },
+      ],
+      programId: this.programId,
+      data,
+    });
+  }
+}
+
+export class LagInjector {
+  private connection: Connection;
+  private config: LagInjectorConfig;
+  private injectedSeries: HistoricalPriceSeries | null = null;
+
+  constructor(connection: Connection, config: LagInjectorConfig) {
+    this.connection = connection;
+    this.config = config;
+  }
+
+  async injectSeries(series: HistoricalPriceSeries): Promise<void> {
+    this.injectedSeries = series;
+    console.log(`[LagInjector] Injected series of ${series.prices.length} prices with ${this.config.lagSlots} slot lag`);
+  }
+
+  async updateOracleWithLag(
+    provider: anchor.AnchorProvider,
+    currentSlot: number,
+    priceIndex: number
+  ): Promise<boolean> {
+    if (!this.injectedSeries || priceIndex >= this.injectedSeries.prices.length) {
+      return false;
+    }
+
+    const laggedIndex = Math.max(0, priceIndex - Math.floor(this.config.lagSlots / 4));
+    const priceData = this.injectedSeries.prices[laggedIndex];
+    const oracleFeed = this.config.oracleFeed;
+
+    try {
+      const ix = new OracleUtils(this.connection, this.config.oracleFeed).createUpdatePriceInstruction(
+        oracleFeed,
+        priceData.price,
+        priceData.timestamp,
+        provider.wallet.publicKey
+      );
+
+      const tx = new anchor.web3.Transaction().add(ix);
+      await provider.sendAndConfirm(tx, [], { commitment: "confirmed" });
+      console.log(`[LagInjector] Updated oracle at slot ${currentSlot} with lagged price $${priceData.price}`);
+      return true;
+    } catch (err) {
+      console.error("[LagInjector] Update failed:", err);
+      return false;
+    }
+  }
+
+  getCurrentLag(): number {
+    return this.config.lagSlots;
+  }
+}
+
+// Export utilities for direct use
+export function checkTWAPFalsePositive(prices: PriceData[], windowSlots: number = 300): boolean {
+  if (prices.length < 4) return false;
+  const recent = prices.slice(-4);
+  const avg = recent.reduce((sum, p) => sum + p.price, 0) / recent.length;
+  const last = recent[recent.length - 1].price;
+  return Math.abs(last - avg) / avg < 0.015; // <1.5% deviation from 15s TWAP
+}
+
+export const createOracleUtils = (connection: Connection, programId: PublicKey) => {
+  return new OracleUtils(connection, programId);
 };
-
-export function getHistoricalPriceSeries(): HistoricalPriceSeries {
-  // Returns the last three Jito depeg price series (hard-coded replay data)
-  const raw = [
-    { price: 0.98, timestamp: Date.now() - 300000 },
-    { price: 0.92, timestamp: Date.now() - 240000 },
-    { price: 0.85, timestamp: Date.now() - 180000 },
-    { price: 0.78, timestamp: Date.now() - 120000 },
-    { price: 0.95, timestamp: Date.now() - 60000 },
-  ].map((p) => OracleUtils.createPriceData(p.price, p.timestamp));
-  return OracleUtils.createHistoricalSeries(raw);
-}
-
-export function checkTWAPFalsePositive(series: HistoricalPriceSeries, twapPeriodMs: number = 15000): boolean {
-  if (series.prices.length < 2) return false;
-  const now = Date.now();
-  const cutoff = now - twapPeriodMs;
-  const recent = series.filter((p) => p.timestamp >= cutoff);
-  if (recent.prices.length === 0) return false;
-
-  let sum = 0;
-  recent.prices.forEach((p) => { sum += p.price; });
-  const twap = sum / recent.prices.length;
-  const lastPrice = recent.prices[recent.prices.length - 1].price;
-  // False-positive if TWAP did not cross a plausible breaker threshold (e.g. 0.90)
-  return twap > 0.90 && lastPrice < 0.90;
-}
-
-// Re-export for convenience
-export { OracleUtils as default };
