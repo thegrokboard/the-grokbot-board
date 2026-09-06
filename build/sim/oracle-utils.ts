@@ -1,5 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { PublicKey, TransactionInstruction } from "@solana/web3.js";
 
 export interface PriceData {
   price: number;
@@ -8,113 +8,145 @@ export interface PriceData {
 
 export interface HistoricalPriceSeries {
   prices: PriceData[];
-  depegStartSlot: number;
+  name: string;
 }
 
 export interface LagInjectorConfig {
+  lagMs: number;
   lagSlots: number;
+}
+
+export interface OracleConfig {
   oraclePubkey: PublicKey;
-  jitoSolMint: PublicKey;
-  testValidator: any; // Anchor's TestValidator interface
-  connection: Connection;
+  feedName: string;
 }
 
 export class OracleUtils {
+  static getHistoricalPriceSeries(): HistoricalPriceSeries[] {
+    // Replay of last three JitoSOL depeg events (synthetic but realistic)
+    return [
+      {
+        name: "jito-depeg-1",
+        prices: [
+          { price: 1.02, timestamp: 0 },
+          { price: 0.98, timestamp: 15 },
+          { price: 0.85, timestamp: 45 },
+          { price: 0.72, timestamp: 90 },
+          { price: 0.68, timestamp: 150 },
+          { price: 0.75, timestamp: 210 },
+          { price: 0.91, timestamp: 300 },
+        ],
+      },
+      {
+        name: "jito-depeg-2",
+        prices: [
+          { price: 1.01, timestamp: 0 },
+          { price: 0.95, timestamp: 30 },
+          { price: 0.81, timestamp: 60 },
+          { price: 0.79, timestamp: 120 },
+          { price: 0.88, timestamp: 200 },
+          { price: 0.97, timestamp: 280 },
+        ],
+      },
+      {
+        name: "jito-depeg-3",
+        prices: [
+          { price: 1.00, timestamp: 0 },
+          { price: 0.89, timestamp: 20 },
+          { price: 0.77, timestamp: 55 },
+          { price: 0.65, timestamp: 100 },
+          { price: 0.71, timestamp: 160 },
+          { price: 0.84, timestamp: 240 },
+          { price: 0.96, timestamp: 310 },
+        ],
+      },
+    ];
+  }
+
+  static createLagInjectorConfig(lagMs: number = 45000, lagSlots: number = 90): LagInjectorConfig {
+    return { lagMs, lagSlots };
+  }
+
+  static createOracleConfig(oraclePubkey: PublicKey, feedName: string = "jitoSOL"): OracleConfig {
+    return { oraclePubkey, feedName };
+  }
+
+  static createUpdatePriceInstruction(
+    oraclePubkey: PublicKey,
+    priceData: PriceData,
+    programId: PublicKey
+  ): TransactionInstruction {
+    // Minimal instruction for test-validator oracle update (mock CPI target)
+    const data = Buffer.from(
+      Uint8Array.from([
+        0, // discriminator for update
+        ...new anchor.BN(Math.floor(priceData.price * 1e9)).toArray("le", 8),
+        ...new anchor.BN(priceData.timestamp).toArray("le", 8),
+      ])
+    );
+    return new TransactionInstruction({
+      keys: [{ pubkey: oraclePubkey, isSigner: false, isWritable: true }],
+      programId,
+      data,
+    });
+  }
+
+  static async sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
+
+export class LagInjector {
   private config: LagInjectorConfig;
-  private currentLag: number = 0;
-  private priceBuffer: Map<number, PriceData> = new Map();
+  private oracleUtils: typeof OracleUtils;
+  private series: HistoricalPriceSeries[] = [];
 
   constructor(config: LagInjectorConfig) {
     this.config = config;
+    this.oracleUtils = OracleUtils;
   }
 
-  async setTestPrice(price: number, slot: number): Promise<void> {
-    const laggedSlot = slot - this.config.lagSlots;
-    const priceData: PriceData = {
-      price,
-      timestamp: Date.now(),
-    };
-    this.priceBuffer.set(laggedSlot, priceData);
-
-    // In a real sim this would update a Switchboard or Pyth oracle account on the test validator
-    // For this pure-onchain harness we simulate via the injected connection
-    console.log(`[OracleUtils] Set test price ${price} at slot ${slot} (lagged to ${laggedSlot})`);
+  injectSeries(series: HistoricalPriceSeries[]): void {
+    this.series = series;
   }
 
-  getPriceAtSlot(slot: number): PriceData | null {
-    // Return the most recent price whose lagged slot <= requested slot
-    let best: PriceData | null = null;
-    let bestSlot = -1;
-    for (const [s, p] of this.priceBuffer) {
-      if (s <= slot && s > bestSlot) {
-        bestSlot = s;
-        best = p;
-      }
-    }
-    return best;
+  getHistoricalPriceSeries(): HistoricalPriceSeries[] {
+    return this.series;
   }
 
-  getHistoricalSeries(): HistoricalPriceSeries {
-    const sortedSlots = Array.from(this.priceBuffer.keys()).sort((a, b) => a - b);
-    const prices: PriceData[] = sortedSlots.map(s => this.priceBuffer.get(s)!);
-    return {
-      prices,
-      depegStartSlot: sortedSlots.length > 0 ? sortedSlots[0] : 0,
-    };
-  }
-
-  advanceSlot(currentSlot: number): void {
-    this.currentLag = Math.max(0, this.currentLag - 1);
-    // Cleanup old buffer entries
-    const minSlot = currentSlot - 1000;
-    for (const s of this.priceBuffer.keys()) {
-      if (s < minSlot) this.priceBuffer.delete(s);
-    }
+  async updateOracleWithLag(
+    price: PriceData,
+    oraclePubkey: PublicKey,
+    provider: anchor.AnchorProvider,
+    programId: PublicKey
+  ): Promise<void> {
+    const laggedTime = price.timestamp * 1000 + this.config.lagMs;
+    await this.oracleUtils.sleep(this.config.lagMs);
+    const ix = this.oracleUtils.createUpdatePriceInstruction(
+      oraclePubkey,
+      { price: price.price, timestamp: Math.floor(laggedTime / 1000) },
+      programId
+    );
+    const tx = new anchor.web3.Transaction().add(ix);
+    await provider.sendAndConfirm(tx);
   }
 }
 
-export function checkTWAPFalsePositive(series: HistoricalPriceSeries, windowSlots: number = 150): boolean {
-  if (series.prices.length < 2) return false;
+export function checkTWAPFalsePositive(prices: PriceData[], windowSeconds: number = 15 * 60): boolean {
+  if (prices.length < 2) return false;
+  const now = prices[prices.length - 1].timestamp;
+  const windowStart = now - windowSeconds;
+  const windowPrices = prices.filter((p) => p.timestamp >= windowStart);
+  if (windowPrices.length < 2) return false;
 
-  const prices = series.prices;
   let sum = 0;
-  let count = 0;
-
-  for (let i = 0; i < prices.length; i++) {
-    sum += prices[i].price;
-    count++;
-    if (count > windowSlots) {
-      sum -= prices[i - windowSlots].price;
-      count--;
-    }
-    const twap = sum / count;
-    const currentPrice = prices[i].price;
-
-    // Simple depeg detection: price < 0.85 for >30% of window considered a true trip
-    if (currentPrice < 0.85 * twap && i > windowSlots * 0.3) {
-      return false; // Real depeg, not false positive
-    }
+  for (const p of windowPrices) {
+    sum += p.price;
   }
-  return true; // No sustained depeg detected = false positive
+  const twap = sum / windowPrices.length;
+  // False positive if TWAP > 0.90 (did not actually breach protection buffer threshold)
+  return twap > 0.90;
 }
 
-export async function loadJitoHistoricalSeries(): Promise<HistoricalPriceSeries> {
-  // Hard-coded replay of last three known JitoSOL depeg price series (simplified)
-  // Real version would load from JSON fixture or RPC archive
-  const prices: PriceData[] = [
-    { price: 0.98, timestamp: 1700000000000 },
-    { price: 0.95, timestamp: 1700000100000 },
-    { price: 0.89, timestamp: 1700000200000 },
-    { price: 0.82, timestamp: 1700000300000 },
-    { price: 0.78, timestamp: 1700000400000 },
-    { price: 0.75, timestamp: 1700000500000 },
-    { price: 0.81, timestamp: 1700000600000 },
-    { price: 0.92, timestamp: 1700000700000 },
-    { price: 0.97, timestamp: 1700000800000 },
-  ];
-
-  return {
-    prices,
-    depegStartSlot: 42000000,
-  };
-}
+export { checkTWAPFalsePositive as checkTWAP };
+export { OracleUtils, LagInjector };
