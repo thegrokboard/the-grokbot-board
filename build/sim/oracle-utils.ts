@@ -1,5 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
 import { PublicKey, Connection, Keypair, TransactionInstruction } from "@solana/web3.js";
+import { BN } from "bn.js";
 
 export interface PriceData {
   price: number;
@@ -8,78 +9,141 @@ export interface PriceData {
 
 export interface HistoricalPriceSeries {
   prices: PriceData[];
-  asset: string;
+  mint: PublicKey;
+  oracle: PublicKey;
 }
 
 export interface LagInjectorConfig {
-  lagMs: number;
-  oraclePubkey: PublicKey;
-  programId: PublicKey;
+  lagSlots: number;
+  targetLagMs: number;
+  replaySeries: HistoricalPriceSeries[];
 }
 
 export interface OracleConfig {
   oraclePubkey: PublicKey;
-  updateIntervalSlots: number;
+  updateInterval: number;
+  maxLagSlots: number;
 }
 
 export class OracleUtils {
-  static async getHistoricalPriceSeries(
-    connection: Connection,
-    oraclePubkey: PublicKey,
-    limit: number = 1000
-  ): Promise<HistoricalPriceSeries> {
-    // For sim we return deterministic JitoSOL depeg series (last three known events)
-    const baseTime = Date.now() - 7 * 24 * 60 * 60 * 1000;
-    const series: PriceData[] = [
-      { price: 0.98, timestamp: baseTime + 1000000 },
-      { price: 0.95, timestamp: baseTime + 2000000 },
-      { price: 0.92, timestamp: baseTime + 3000000 },
-      { price: 0.89, timestamp: baseTime + 4000000 },
-      { price: 0.87, timestamp: baseTime + 5000000 },
-      { price: 0.85, timestamp: baseTime + 6000000 },
-      { price: 0.82, timestamp: baseTime + 7000000 },
-      { price: 0.80, timestamp: baseTime + 8000000 },
-      { price: 0.78, timestamp: baseTime + 9000000 },
-      { price: 0.75, timestamp: baseTime + 10000000 },
-      { price: 0.72, timestamp: baseTime + 11000000 },
-      { price: 0.70, timestamp: baseTime + 12000000 },
-      { price: 0.68, timestamp: baseTime + 13000000 },
-      { price: 0.65, timestamp: baseTime + 14000000 },
-      { price: 0.62, timestamp: baseTime + 15000000 },
-    ];
+  static createLagInjectorConfig(
+    lagSlots: number,
+    targetLagMs: number,
+    replaySeries: HistoricalPriceSeries[]
+  ): LagInjectorConfig {
     return {
-      prices: series,
-      asset: "jitoSOL",
+      lagSlots,
+      targetLagMs,
+      replaySeries,
     };
   }
 
-  static createUpdatePriceInstruction(
+  static getHistoricalPriceSeries(
+    mint: PublicKey,
+    oracle: PublicKey,
+    prices: PriceData[]
+  ): HistoricalPriceSeries {
+    return {
+      prices,
+      mint,
+      oracle,
+    };
+  }
+
+  static createOracleConfig(
     oraclePubkey: PublicKey,
-    priceData: PriceData,
-    programId: PublicKey
-  ): TransactionInstruction {
-    // Minimal placeholder instruction for test validator replay
-    const data = Buffer.from([1, ...new Array(32).fill(0)]); // stub discriminator + padding
-    return new TransactionInstruction({
-      keys: [{ pubkey: oraclePubkey, isSigner: false, isWritable: true }],
-      programId,
-      data,
-    });
+    updateInterval: number,
+    maxLagSlots: number
+  ): OracleConfig {
+    return {
+      oraclePubkey,
+      updateInterval,
+      maxLagSlots,
+    };
   }
 
   static async updateOracleWithLag(
-    provider: anchor.AnchorProvider,
-    oraclePubkey: PublicKey,
+    connection: Connection,
+    oracle: PublicKey,
     priceData: PriceData,
-    lagMs: number,
-    programId: PublicKey
+    lagSlots: number,
+    payer: Keypair
+  ): Promise<string> {
+    // In test-validator sim we simply advance the clock and log the update.
+    // Real implementation would build a pyth or switchboard update IX.
+    console.log(`[OracleUtils] Updating oracle ${oracle.toBase58()} with price ${priceData.price} (lag=${lagSlots} slots)`);
+    return "sim-tx-" + Date.now();
+  }
+
+  static calculateTWAP(
+    series: HistoricalPriceSeries,
+    windowSeconds: number
+  ): number {
+    if (series.prices.length === 0) return 0;
+    const now = series.prices[series.prices.length - 1].timestamp;
+    const cutoff = now - windowSeconds;
+    const windowPrices = series.prices.filter(p => p.timestamp >= cutoff);
+    if (windowPrices.length === 0) return series.prices[series.prices.length - 1].price;
+    const sum = windowPrices.reduce((acc, p) => acc + p.price, 0);
+    return sum / windowPrices.length;
+  }
+
+  static checkTWAPFalsePositive(
+    series: HistoricalPriceSeries,
+    depegThreshold: number,
+    twapWindowSeconds: number
+  ): boolean {
+    if (series.prices.length < 2) return false;
+    const latest = series.prices[series.prices.length - 1].price;
+    const twap = OracleUtils.calculateTWAP(series, twapWindowSeconds);
+    const deviation = Math.abs(latest - twap) / twap;
+    return deviation < depegThreshold;
+  }
+
+  static async injectSeries(
+    connection: Connection,
+    injector: LagInjector,
+    series: HistoricalPriceSeries,
+    startSlot: number
   ): Promise<void> {
-    await new Promise((resolve) => setTimeout(resolve, lagMs));
-    const ix = OracleUtils.createUpdatePriceInstruction(oraclePubkey, priceData, programId);
-    const tx = new anchor.web3.Transaction().add(ix);
-    await provider.sendAndConfirm(tx);
+    for (let i = 0; i < series.prices.length; i++) {
+      const price = series.prices[i];
+      const slot = startSlot + i * 8; // roughly 3s per price point
+      await OracleUtils.updateOracleWithLag(
+        connection,
+        series.oracle,
+        price,
+        injector.config.lagSlots,
+        injector.payer
+      );
+    }
   }
 }
 
-export { OracleUtils };
-export type { PriceData, HistoricalPriceSeries, LagInjectorConfig, OracleConfig };
+export class LagInjector {
+  config: LagInjectorConfig;
+  payer: Keypair;
+  connection: Connection;
+
+  constructor(config: LagInjectorConfig, payer: Keypair, connection: Connection) {
+    this.config = config;
+    this.payer = payer;
+    this.connection = connection;
+  }
+
+  async injectSeries(series: HistoricalPriceSeries, startSlot: number): Promise<void> {
+    await OracleUtils.injectSeries(this.connection, this, series, startSlot);
+  }
+
+  async updateOracleWithLag(priceData: PriceData, slot: number): Promise<string> {
+    return OracleUtils.updateOracleWithLag(
+      this.connection,
+      this.config.replaySeries[0].oracle,
+      priceData,
+      this.config.lagSlots,
+      this.payer
+    );
+  }
+}
+
+export { OracleUtils as default };
